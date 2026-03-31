@@ -6,7 +6,16 @@
 #include "WinMTRNet.h"
 #include "WinMTRDialog.h"
 #include <iostream>
+#include <string>
 #include <sstream>
+#include <vector>
+#include <windns.h>
+
+#pragma comment(lib, "Dnsapi.lib")
+
+#ifndef DNS_TYPE_TEXT
+#define DNS_TYPE_TEXT 0x0010
+#endif
 
 #ifdef _DEBUG
 #	define TRACE_MSG(msg)										\
@@ -37,6 +46,78 @@ struct dns_resolver_thread {
 	WinMTRNet*	winmtr;
 	int			index;
 };
+
+static int GetSockaddrLength(const sockaddr* addr)
+{
+	if(!addr) return 0;
+	return addr->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
+}
+
+static std::string TrimCopy(const std::string& value)
+{
+	size_t start = value.find_first_not_of(" \t\r\n");
+	if(start == std::string::npos) return "";
+	size_t end = value.find_last_not_of(" \t\r\n");
+	return value.substr(start, end - start + 1);
+}
+
+static bool BuildAsnLookupQuery(const sockaddr* addr, std::string& query)
+{
+	if(!addr) return false;
+	query.clear();
+	if(addr->sa_family == AF_INET) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&reinterpret_cast<const sockaddr_in*>(addr)->sin_addr);
+		char buffer[64];
+		sprintf(buffer, "%u.%u.%u.%u.origin.asn.cymru.com", bytes[3], bytes[2], bytes[1], bytes[0]);
+		query = buffer;
+		return true;
+	}
+	if(addr->sa_family == AF_INET6) {
+		const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&reinterpret_cast<const sockaddr_in6*>(addr)->sin6_addr);
+		query.reserve(32 * 2 + strlen("origin6.asn.cymru.com"));
+		static const char* hex = "0123456789abcdef";
+		for(int i = 15; i >= 0; --i) {
+			query.push_back(hex[bytes[i] & 0x0F]);
+			query.push_back('.');
+			query.push_back(hex[(bytes[i] >> 4) & 0x0F]);
+			query.push_back('.');
+		}
+		query += "origin6.asn.cymru.com";
+		return true;
+	}
+	return false;
+}
+
+static bool LookupAsn(const sockaddr* addr, std::string& asn)
+{
+	std::string query;
+	if(!BuildAsnLookupQuery(addr, query)) return false;
+	PDNS_RECORD records = NULL;
+	DNS_STATUS status = DnsQuery_A(query.c_str(), DNS_TYPE_TEXT, DNS_QUERY_STANDARD, NULL, &records, NULL);
+	if(status != ERROR_SUCCESS || !records) {
+		if(records) DnsRecordListFree(records, DnsFreeRecordList);
+		return false;
+	}
+
+	bool found = false;
+	for(PDNS_RECORD record = records; record; record = record->pNext) {
+		if(record->wType != DNS_TYPE_TEXT || record->Data.TXT.dwStringCount == 0) continue;
+		std::string text;
+		for(DWORD i = 0; i < record->Data.TXT.dwStringCount; ++i) {
+			if(record->Data.TXT.pStringArray[i]) text += record->Data.TXT.pStringArray[i];
+		}
+		size_t pipePos = text.find('|');
+		std::string field = TrimCopy(pipePos == std::string::npos ? text : text.substr(0, pipePos));
+		if(field.empty() || field == "NA") continue;
+		asn = "AS";
+		asn += field;
+		found = true;
+		break;
+	}
+
+	DnsRecordListFree(records, DnsFreeRecordList);
+	return found;
+}
 
 unsigned WINAPI TraceThread(void* p);
 unsigned WINAPI TraceThread6(void* p);
@@ -312,6 +393,14 @@ int WinMTRNet::GetName(int at, char* n)
 	return 0;
 }
 
+int WinMTRNet::GetASN(int at, char* n)
+{
+	WaitForSingleObject(ghMutex, INFINITE);
+	strcpy(n, host[at].asn);
+	ReleaseMutex(ghMutex);
+	return 0;
+}
+
 int WinMTRNet::GetBest(int at)
 {
 	WaitForSingleObject(ghMutex, INFINITE);
@@ -390,40 +479,58 @@ int WinMTRNet::GetMax()
 
 void WinMTRNet::SetAddr(int at, u_long addr)
 {
+	bool shouldResolve = false;
+	dns_resolver_thread* dnt = NULL;
 	WaitForSingleObject(ghMutex, INFINITE);
 	if(host[at].addr.sin_addr.s_addr==0) {
 		TRACE_MSG("Start DnsResolverThread for new address " << addr << ". Old addr value was " << host[at].addr.sin_addr.s_addr);
 		host[at].addr.sin_family=AF_INET;
 		host[at].addr.sin_addr.s_addr=addr;
-		dns_resolver_thread* dnt=new dns_resolver_thread;
+		dnt=new dns_resolver_thread;
 		dnt->index=at;
 		dnt->winmtr=this;
+		shouldResolve = true;
+	}
+	ReleaseMutex(ghMutex);
+	if(shouldResolve) {
 		if(wmtrdlg->useDNS) _beginthread(DnsResolverThread, 0, dnt);
 		else DnsResolverThread(dnt);
 	}
-	ReleaseMutex(ghMutex);
 }
 
 void WinMTRNet::SetAddr6(int at, IPV6_ADDRESS_EX addrex)
 {
+	bool shouldResolve = false;
+	dns_resolver_thread* dnt = NULL;
 	WaitForSingleObject(ghMutex, INFINITE);
 	if(!(host[at].addr6.sin6_addr.u.Word[0]|host[at].addr6.sin6_addr.u.Word[1]|host[at].addr6.sin6_addr.u.Word[2]|host[at].addr6.sin6_addr.u.Word[3]|host[at].addr6.sin6_addr.u.Word[4]|host[at].addr6.sin6_addr.u.Word[5]|host[at].addr6.sin6_addr.u.Word[6]|host[at].addr6.sin6_addr.u.Word[7])) {
 		TRACE_MSG("Start DnsResolverThread for new address " << addrex.sin6_addr[0] << ". Old addr value was " << host[at].addr6.sin6_addr.u.Word[0]);
 		host[at].addr6.sin6_family=AF_INET6;
 		host[at].addr6.sin6_addr=*(in6_addr*)&addrex.sin6_addr;
-		dns_resolver_thread* dnt=new dns_resolver_thread;
+		dnt=new dns_resolver_thread;
 		dnt->index=at;
 		dnt->winmtr=this;
+		shouldResolve = true;
+	}
+	ReleaseMutex(ghMutex);
+	if(shouldResolve) {
 		if(wmtrdlg->useDNS) _beginthread(DnsResolverThread,0,dnt);
 		else DnsResolverThread(dnt);
 	}
-	ReleaseMutex(ghMutex);
 }
 
 void WinMTRNet::SetName(int at, char* n)
 {
 	WaitForSingleObject(ghMutex, INFINITE);
 	strcpy(host[at].name, n);
+	ReleaseMutex(ghMutex);
+}
+
+void WinMTRNet::SetASN(int at, const char* n)
+{
+	WaitForSingleObject(ghMutex, INFINITE);
+	if(n && *n) strcpy(host[at].asn, n);
+	else host[at].asn[0] = '\0';
 	ReleaseMutex(ghMutex);
 }
 
@@ -508,12 +615,18 @@ void DnsResolverThread(void* p)
 	dns_resolver_thread* dnt=(dns_resolver_thread*)p;
 	WinMTRNet* wn=dnt->winmtr;
 	char hostname[NI_MAXHOST];
-	if(!getnameinfo(wn->GetAddr(dnt->index),sizeof(sockaddr_in6),hostname,NI_MAXHOST,NULL,0,NI_NUMERICHOST)) {
+	sockaddr* address = wn->GetAddr(dnt->index);
+	int addressLength = GetSockaddrLength(address);
+	if(!getnameinfo(address,addressLength,hostname,NI_MAXHOST,NULL,0,NI_NUMERICHOST)) {
 		wn->SetName(dnt->index,hostname);
+	}
+	std::string asn;
+	if(LookupAsn(address, asn)) {
+		wn->SetASN(dnt->index, asn.c_str());
 	}
 	if(wn->wmtrdlg->useDNS) {
 		TRACE_MSG("DNS resolver thread started.");
-		if(!getnameinfo(wn->GetAddr(dnt->index),sizeof(sockaddr_in6),hostname,NI_MAXHOST,NULL,0,0)) {
+		if(!getnameinfo(address,addressLength,hostname,NI_MAXHOST,NULL,0,0)) {
 			wn->SetName(dnt->index,hostname);
 		}
 		TRACE_MSG("DNS resolver thread stopped.");

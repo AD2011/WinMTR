@@ -11,3 +11,32 @@
 *.lai
 *.la
 *.a
+
+# Visual Studio user and workspace state
+.vs/
+src/.vs/
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+
+# Build outputs and intermediates
+[Dd]ebug/
+[Dd]ebug_*/
+[Rr]elease/
+[Rr]elease_*/
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.idb
+*.res
+*.log
+*.recipe
+*.tlog
+*.lastbuildstate
+
+# Temporary build/test directories
+src/Release_x64_cli/

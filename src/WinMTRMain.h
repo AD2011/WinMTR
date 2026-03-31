@@ -16,6 +16,26 @@
 #include "WinMTRDialog.h"
 #include <string>
 
+struct WinMTRCommandLineOptions {
+	WinMTRCommandLineOptions()
+		: showHelp(false),
+		  cliMode(false),
+		  forceGui(false),
+		  reportCycles(0),
+		  reportDurationSeconds(0),
+		  useASNLookup(true)
+	{
+	}
+
+	bool showHelp;
+	bool cliMode;
+	bool forceGui;
+	int reportCycles;
+	int reportDurationSeconds;
+	bool useASNLookup;
+	std::string hostName;
+};
+
 
 //*****************************************************************************
 // CLASS:  WinMTRMain
@@ -33,7 +53,12 @@ public:
 	DECLARE_MESSAGE_MAP()
 	
 private:
-	void	ParseCommandLineParams(LPTSTR cmd, WinMTRDialog* wmtrdlg);
+	bool	ParseCommandLineParams(LPTSTR cmd, WinMTRDialog* wmtrdlg, WinMTRCommandLineOptions& options);
+	bool	RunCliMode(const WinMTRCommandLineOptions& options, WinMTRDialog* wmtrdlg);
+	void	HideOwnedConsoleWindow() const;
+	bool	SetupConsole() const;
+	void	WriteConsoleText(const char* text) const;
+	void	PrintHelp() const;
 	int		GetParamValue(LPTSTR cmd, char* param, char sparam, char* value);
 	int		GetHostNameParamValue(LPTSTR cmd, std::string& value);
 	

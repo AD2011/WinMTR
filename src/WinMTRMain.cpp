@@ -27,6 +27,9 @@
 #include "WinMTRHelp.h"
 #include <algorithm>
 #include <iostream>
+#include <set>
+#include <sstream>
+#include <vector>
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -73,14 +76,34 @@ BOOL WinMTRMain::InitInstance()
 	
 	WinMTRDialog mtrDialog;
 	m_pMainWnd = &mtrDialog;
-	
+
+	WinMTRCommandLineOptions options;
+	std::vector<char> cmdBuffer;
 	if(strlen(m_lpCmdLine)) {
-		strcat(m_lpCmdLine," ");
-		ParseCommandLineParams(m_lpCmdLine, &mtrDialog);
+		size_t len = strlen(m_lpCmdLine);
+		cmdBuffer.resize(len + 2, '\0');
+		memcpy(&cmdBuffer[0], m_lpCmdLine, len);
+		cmdBuffer[len] = ' ';
+		if(!ParseCommandLineParams(&cmdBuffer[0], &mtrDialog, options)) {
+			return FALSE;
+		}
 	}
-	
+
+	if(options.showHelp) {
+		if(SetupConsole()) {
+			PrintHelp();
+		}
+		return FALSE;
+	}
+
+	if(options.cliMode) {
+		RunCliMode(options, &mtrDialog);
+		return FALSE;
+	}
+
+	HideOwnedConsoleWindow();
 	mtrDialog.DoModal();
-	
+
 	
 	return FALSE;
 }
@@ -91,20 +114,20 @@ BOOL WinMTRMain::InitInstance()
 //
 //
 //*****************************************************************************
-void WinMTRMain::ParseCommandLineParams(LPTSTR cmd, WinMTRDialog* wmtrdlg)
+bool WinMTRMain::ParseCommandLineParams(LPTSTR cmd, WinMTRDialog* wmtrdlg, WinMTRCommandLineOptions& options)
 {
 	char value[1024];
 	std::string host_name = "";
+	bool hasAnyCliArguments = strlen(cmd) > 1;
 	
-	if(GetParamValue(cmd, "help",'h', value)) {
-		WinMTRHelp mtrHelp;
-		m_pMainWnd = &mtrHelp;
-		mtrHelp.DoModal();
-		exit(0);
+	if(GetParamValue(cmd, "help",'h', NULL)) {
+		options.showHelp = true;
+		return true;
 	}
 	
 	if(GetHostNameParamValue(cmd, host_name)) {
 		wmtrdlg->SetHostName(host_name.c_str());
+		options.hostName = host_name;
 	}
 	if(GetParamValue(cmd, "interval",'i', value)) {
 		wmtrdlg->SetInterval((float)atof(value));
@@ -130,6 +153,96 @@ void WinMTRMain::ParseCommandLineParams(LPTSTR cmd, WinMTRDialog* wmtrdlg)
 		wmtrdlg->hasUseIPv6FromCmdLine=true;
 		wmtrdlg->useIPv6=0;
 	}
+	if(GetParamValue(cmd, "gui", 'g', NULL)) {
+		options.forceGui = true;
+	}
+	if(GetParamValue(cmd, "report", 'r', NULL)) {
+		options.cliMode = true;
+	}
+	if(GetParamValue(cmd, "report-cycles", 'c', value)) {
+		options.cliMode = true;
+		options.reportCycles = max(1, atoi(value));
+	}
+	if(GetParamValue(cmd, "report-seconds", 'w', value)) {
+		options.cliMode = true;
+		options.reportDurationSeconds = max(1, atoi(value));
+	}
+	if(!options.forceGui && hasAnyCliArguments) {
+		options.cliMode = true;
+	}
+	return true;
+}
+
+bool WinMTRMain::RunCliMode(const WinMTRCommandLineOptions& options, WinMTRDialog* wmtrdlg)
+{
+	if(!SetupConsole()) return false;
+	if(options.hostName.empty()) {
+		WriteConsoleText("No host specified.\n\n");
+		PrintHelp();
+		return false;
+	}
+	if(!wmtrdlg->wmtrnet->initialized) {
+		WriteConsoleText("WinMTR network initialization failed.\n");
+		return false;
+	}
+	return wmtrdlg->RunCliTrace(options.hostName.c_str(), options.reportCycles, options.reportDurationSeconds) != 0;
+}
+
+void WinMTRMain::HideOwnedConsoleWindow() const
+{
+	HWND consoleWindow = GetConsoleWindow();
+	if(!consoleWindow) return;
+
+	DWORD processIds[8] = {0};
+	DWORD count = GetConsoleProcessList(processIds, sizeof(processIds) / sizeof(processIds[0]));
+	if(count <= 1) {
+		ShowWindow(consoleWindow, SW_HIDE);
+	}
+}
+
+bool WinMTRMain::SetupConsole() const
+{
+	HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+	if(output != NULL && output != INVALID_HANDLE_VALUE) return true;
+
+	if(!AttachConsole(ATTACH_PARENT_PROCESS) && GetLastError() != ERROR_ACCESS_DENIED) {
+		if(!AllocConsole()) {
+			return false;
+		}
+	}
+	output = GetStdHandle(STD_OUTPUT_HANDLE);
+	return output != NULL && output != INVALID_HANDLE_VALUE;
+}
+
+void WinMTRMain::WriteConsoleText(const char* text) const
+{
+	if(!text || !*text) return;
+	HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+	if(output == INVALID_HANDLE_VALUE || output == NULL) return;
+
+	DWORD written = 0;
+	WriteFile(output, text, (DWORD)strlen(text), &written, NULL);
+}
+
+void WinMTRMain::PrintHelp() const
+{
+	std::ostringstream help;
+	help << "WinMTR (Redux) command line usage:\n";
+	help << "  WinMTR.exe [options] host\n\n";
+	help << "Options:\n";
+	help << "  -h, --help               Show this help text.\n";
+	help << "  -g, --gui                Force the GUI even when a host is provided.\n";
+	help << "  -r, --report             Run without the GUI in live terminal mode.\n";
+	help << "  -c, --report-cycles N    Stop after N report intervals.\n";
+	help << "  -w, --report-seconds N   Stop after N seconds.\n";
+	help << "  -i, --interval SECONDS   Probe interval.\n";
+	help << "  -s, --size BYTES         ICMP payload size.\n";
+	help << "  -n, --numeric            Do not perform reverse DNS lookups.\n";
+	help << "  -4, --ipv4               Force IPv4.\n";
+	help << "  -6, --ipv6               Force IPv6.\n\n";
+	help << "CLI mode refreshes continuously until Ctrl+C by default.\n";
+	help << "CLI reports include per-hop ASN lookup when available.\n";
+	WriteConsoleText(help.str().c_str());
 }
 
 //*****************************************************************************
@@ -145,11 +258,15 @@ int WinMTRMain::GetParamValue(LPTSTR cmd, char* param, char sparam, char* value)
 	char p_short[1024];
 	
 	sprintf(p_long,"--%s ", param);
-	sprintf(p_short,"-%c ", sparam);
+	p_short[0] = '\0';
+	if(sparam)
+		sprintf(p_short,"-%c ", sparam);
 	
 	if((p=strstr(cmd, p_long))) ;
-	else
+	else if(sparam)
 		p=strstr(cmd, p_short);
+	else
+		p = NULL;
 		
 	if(p == NULL)
 		return 0;
@@ -176,39 +293,47 @@ int WinMTRMain::GetParamValue(LPTSTR cmd, char* param, char sparam, char* value)
 //*****************************************************************************
 int WinMTRMain::GetHostNameParamValue(LPTSTR cmd, std::string& host_name)
 {
-// WinMTR -h -i 1 -n google.com
-	size_t size = strlen(cmd);
-	std::string name = "";
-	while(cmd[--size] == ' ');
-	
-	size++;
-	while(size-- && cmd[size] != ' ' && (cmd[size] != '-' || cmd[size - 1] != ' ')) {
-		name = cmd[size ] + name;
+	std::vector<std::string> args;
+	std::string current;
+	bool inQuotes = false;
+	for(size_t i = 0; cmd[i]; ++i) {
+		char ch = cmd[i];
+		if(ch == '"') {
+			inQuotes = !inQuotes;
+			continue;
+		}
+		if(!inQuotes && isspace((unsigned char)ch)) {
+			if(!current.empty()) {
+				args.push_back(current);
+				current.clear();
+			}
+			continue;
+		}
+		current.push_back(ch);
 	}
-	
-	if(size == -1) {
-		if(name.length() == 0) {
-			return 0;
-		} else {
-			host_name = name;
+	if(!current.empty()) {
+		args.push_back(current);
+	}
+
+	static const std::set<std::string> valueOptions = {
+		"-i", "--interval",
+		"-s", "--size",
+		"-m", "--maxLRU",
+		"-c", "--report-cycles",
+		"-w", "--report-seconds"
+	};
+
+	for(size_t i = 0; i < args.size(); ++i) {
+		const std::string& arg = args[i];
+		if(arg.empty()) continue;
+		if(arg[0] != '-') {
+			host_name = arg;
 			return 1;
 		}
+		if(valueOptions.find(arg) != valueOptions.end()) {
+			++i;
+		}
 	}
-	if(cmd[size] == '-' && cmd[size - 1] == ' ') {
-		// no target specified
-		return 0;
-	}
-	
-	std::string possible_argument = "";
-	
-	while(size-- && cmd[size] != ' ') {
-		possible_argument = cmd[size] + possible_argument;
-	}
-	
-	if(possible_argument.length() && (possible_argument[0] != '-' || possible_argument == "-n" || possible_argument == "--numeric" || possible_argument == "-6" || possible_argument == "--ipv6" || possible_argument == "-4" || possible_argument == "--ipv4")) {
-		host_name = name;
-		return 1;
-	}
-	
+
 	return 0;
 }

@@ -9,6 +9,7 @@ with IPv6 support and other different enhancements and bug fixes
 #### Differences to [WinMTR](http://winmtr.net/) 0.98
 - `[x]` - removed Windows 2000 support <br>
 - `[x]` + added IPv6 support <br>
+- `[x]` + added CLI report mode with ASN lookup support <br>
 - `[x]` + clickable entries when stopped.. *(why the heck wasn't it possible before?)* <br>
 - `[x]` * added start delay of about 30ms for each hop *(870ms before the 30th hop gets queried) <br>
 this should improve performance and reduces network load* <br>
@@ -24,6 +25,28 @@ this should improve performance and reduces network load* <br>
 * Microsoft Visual C++ 2010 Redistributables
 ([32bit](http://microsoft.com/en-us/download/details.aspx?id=5555) |
 [64bit](http://microsoft.com/en-us/download/details.aspx?id=14632)) or use static build
+
+### CLI usage
+WinMTR now defaults to CLI mode when you launch it from the command line with a target host. Use `--gui` if you want to force the desktop window instead.
+
+```text
+WinMTR.exe --report-cycles 10 1.1.1.1
+WinMTR.exe --report-seconds 30 --numeric example.com
+WinMTR.exe --gui example.com
+```
+
+Supported CLI options include:
+- `-g`, `--gui`
+- `-r`, `--report`
+- `-c`, `--report-cycles <count>`
+- `-w`, `--report-seconds <seconds>`
+- `-i`, `--interval <seconds>`
+- `-s`, `--size <bytes>`
+- `-n`, `--numeric`
+- `-4`, `--ipv4`
+- `-6`, `--ipv6`
+
+CLI and exported reports now include per-hop ASN data when it can be resolved.
 
 ### About me / why I decided to create this fork
 There isn't that much to say actually, I've been using IPv6 for a few years now thanks to [**SixXS**](http://sixxs.net/)

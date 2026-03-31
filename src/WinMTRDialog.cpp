@@ -10,6 +10,7 @@
 #include "WinMTRProperties.h"
 #include "WinMTRNet.h"
 #include <iostream>
+#include <string>
 #include <sstream>
 
 #ifdef _DEBUG
@@ -27,6 +28,127 @@ static char THIS_FILE[] = __FILE__;
 #endif
 
 void PingThread(void* p);
+unsigned WINAPI CliTraceThread(void* p);
+
+static int GetSockaddrLength(const sockaddr* addr)
+{
+	if(!addr) return 0;
+	return addr->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
+}
+
+static std::string HtmlEscape(const char* value)
+{
+	std::string source = value ? value : "";
+	std::string escaped;
+	for(size_t i = 0; i < source.length(); ++i) {
+		switch(source[i]) {
+		case '&': escaped += "&amp;"; break;
+		case '<': escaped += "&lt;"; break;
+		case '>': escaped += "&gt;"; break;
+		case '"': escaped += "&quot;"; break;
+		default: escaped.push_back(source[i]); break;
+		}
+	}
+	return escaped;
+}
+
+struct cli_trace_thread {
+	WinMTRDialog* dialog;
+	sockaddr_storage address;
+	int addressLength;
+};
+
+static volatile LONG g_cliStopRequested = 0;
+
+static BOOL WINAPI CliConsoleHandler(DWORD signal)
+{
+	switch(signal) {
+	case CTRL_C_EVENT:
+	case CTRL_BREAK_EVENT:
+	case CTRL_CLOSE_EVENT:
+	case CTRL_LOGOFF_EVENT:
+	case CTRL_SHUTDOWN_EVENT:
+		InterlockedExchange(&g_cliStopRequested, 1);
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
+static void WriteCliOutput(const char* text)
+{
+	if(!text || !*text) return;
+	HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+	if(output == NULL || output == INVALID_HANDLE_VALUE) return;
+	DWORD written = 0;
+	WriteFile(output, text, (DWORD)strlen(text), &written, NULL);
+}
+
+static bool ClearCliScreen()
+{
+	HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+	if(output == NULL || output == INVALID_HANDLE_VALUE) return false;
+
+	CONSOLE_SCREEN_BUFFER_INFO csbi;
+	if(!GetConsoleScreenBufferInfo(output, &csbi)) return false;
+
+	COORD home = {0, 0};
+	DWORD cellCount = csbi.dwSize.X * csbi.dwSize.Y;
+	DWORD written = 0;
+	FillConsoleOutputCharacter(output, ' ', cellCount, home, &written);
+	FillConsoleOutputAttribute(output, csbi.wAttributes, cellCount, home, &written);
+	SetConsoleCursorPosition(output, home);
+	return true;
+}
+
+static std::string BuildCliScreen(WinMTRDialog* dialog, const char* hostname, int cycles, int durationSeconds, DWORD elapsedMs)
+{
+	char host[255];
+	char asn[64];
+	char line[1024];
+	std::ostringstream screen;
+	int nh = dialog->wmtrnet->GetMax();
+	int currentCycle = dialog->wmtrnet->GetXmit(0);
+
+	screen << "WinMTR live report for " << hostname << "\r\n";
+	screen << "Press Ctrl+C to stop.\r\n\r\n";
+	screen << "|--------------------------------------------------------------------------------------------------------------|\r\n";
+	screen << "|                                               WinMTR statistics                                              |\r\n";
+	screen << "|                          Host                           - ASN        - %  | Sent | Recv | Best | Avrg | Wrst | Last |\r\n";
+	screen << "|---------------------------------------------------------|------------|----|------|------|------|------|------|------|\r\n";
+
+	for(int i = 0; i < nh; ++i) {
+		dialog->wmtrnet->GetName(i, host);
+		if(strcmp(host, "") == 0) strcpy(host, "No response from host");
+		dialog->wmtrnet->GetASN(i, asn);
+		if(strcmp(asn, "") == 0) strcpy(asn, "-");
+
+		sprintf(line, "|%57.57s | %-10.10s | %2d | %4d | %4d | %4d | %4d | %4d | %4d |\r\n",
+			host,
+			asn,
+			dialog->wmtrnet->GetPercent(i),
+			dialog->wmtrnet->GetXmit(i),
+			dialog->wmtrnet->GetReturned(i),
+			dialog->wmtrnet->GetBest(i),
+			dialog->wmtrnet->GetAvg(i),
+			dialog->wmtrnet->GetWorst(i),
+			dialog->wmtrnet->GetLast(i));
+		screen << line;
+	}
+
+	screen << "|_________________________________________________________|____________|____|______|______|______|______|______|______|\r\n";
+	screen << "   WinMTR v1.00 GPLv2 (original by Appnor MSP - Fully Managed Hosting & Cloud Provider)\r\n\r\n";
+
+	if(durationSeconds > 0) {
+		screen << "Elapsed: " << (elapsedMs / 1000) << "s / " << durationSeconds << "s";
+	} else if(cycles > 0) {
+		screen << "Cycles: " << currentCycle << " / " << cycles;
+	} else {
+		screen << "Cycles: " << currentCycle;
+	}
+	screen << "\r\n";
+	return screen.str();
+}
 
 //*****************************************************************************
 // BEGIN_MESSAGE_MAP
@@ -589,37 +711,7 @@ void WinMTRDialog::OnOptions()
 //*****************************************************************************
 void WinMTRDialog::OnCTTC()
 {
-	char buf[255], t_buf[1000], f_buf[255*100];
-	
-	int nh = wmtrnet->GetMax();
-	
-	strcpy(f_buf,  "|------------------------------------------------------------------------------------------|\r\n");
-	sprintf(t_buf, "|                                      WinMTR statistics                                   |\r\n");
-	strcat(f_buf, t_buf);
-	sprintf(t_buf, "|                       Host              -   %%  | Sent | Recv | Best | Avrg | Wrst | Last |\r\n");
-	strcat(f_buf, t_buf);
-	sprintf(t_buf, "|------------------------------------------------|------|------|------|------|------|------|\r\n");
-	strcat(f_buf, t_buf);
-	
-	for(int i=0; i <nh ; i++) {
-		wmtrnet->GetName(i, buf);
-		if(strcmp(buf,"")==0) strcpy(buf,"No response from host");
-		
-		sprintf(t_buf, "|%40s - %4d | %4d | %4d | %4d | %4d | %4d | %4d |\r\n" ,
-				buf, wmtrnet->GetPercent(i),
-				wmtrnet->GetXmit(i), wmtrnet->GetReturned(i), wmtrnet->GetBest(i),
-				wmtrnet->GetAvg(i), wmtrnet->GetWorst(i), wmtrnet->GetLast(i));
-		strcat(f_buf, t_buf);
-	}
-	
-	sprintf(t_buf, "|________________________________________________|______|______|______|______|______|______|\r\n");
-	strcat(f_buf, t_buf);
-	
-	CString cs_tmp((LPCSTR)IDS_STRING_SB_NAME);
-	strcat(f_buf, "   ");
-	strcat(f_buf, (LPCTSTR)cs_tmp);
-	
-	CString source(f_buf);
+	CString source(BuildTextReport().c_str());
 	
 	HGLOBAL clipbuffer;
 	char* buffer;
@@ -644,35 +736,7 @@ void WinMTRDialog::OnCTTC()
 //*****************************************************************************
 void WinMTRDialog::OnCHTC()
 {
-	char buf[255], t_buf[1000], f_buf[255*100];
-	
-	int nh = wmtrnet->GetMax();
-	
-	strcpy(f_buf, "<html><head><title>WinMTR Statistics</title></head><body bgcolor=\"white\">\r\n");
-	sprintf(t_buf, "<center><h2>WinMTR statistics</h2></center>\r\n");
-	strcat(f_buf, t_buf);
-	
-	sprintf(t_buf, "<p align=\"center\"> <table border=\"1\" align=\"center\">\r\n");
-	strcat(f_buf, t_buf);
-	
-	sprintf(t_buf, "<tr><td>Host</td> <td>%%</td> <td>Sent</td> <td>Recv</td> <td>Best</td> <td>Avrg</td> <td>Wrst</td> <td>Last</td></tr>\r\n");
-	strcat(f_buf, t_buf);
-	
-	for(int i=0; i <nh ; i++) {
-		wmtrnet->GetName(i, buf);
-		if(strcmp(buf,"")==0) strcpy(buf,"No response from host");
-		
-		sprintf(t_buf, "<tr><td>%s</td> <td>%4d</td> <td>%4d</td> <td>%4d</td> <td>%4d</td> <td>%4d</td> <td>%4d</td> <td>%4d</td></tr>\r\n" ,
-				buf, wmtrnet->GetPercent(i),
-				wmtrnet->GetXmit(i), wmtrnet->GetReturned(i), wmtrnet->GetBest(i),
-				wmtrnet->GetAvg(i), wmtrnet->GetWorst(i), wmtrnet->GetLast(i));
-		strcat(f_buf, t_buf);
-	}
-	
-	sprintf(t_buf, "</table></body></html>\r\n");
-	strcat(f_buf, t_buf);
-	
-	CString source(f_buf);
+	CString source(BuildHtmlReport().c_str());
 	
 	HGLOBAL clipbuffer;
 	char* buffer;
@@ -706,41 +770,10 @@ void WinMTRDialog::OnEXPT()
 					szFilter,
 					this);
 	if(dlg.DoModal() == IDOK) {
-	
-		char buf[255], t_buf[1000], f_buf[255*100];
-		
-		int nh = wmtrnet->GetMax();
-		
-		strcpy(f_buf,  "|------------------------------------------------------------------------------------------|\r\n");
-		sprintf(t_buf, "|                                      WinMTR statistics                                   |\r\n");
-		strcat(f_buf, t_buf);
-		sprintf(t_buf, "|                       Host              -   %%  | Sent | Recv | Best | Avrg | Wrst | Last |\r\n");
-		strcat(f_buf, t_buf);
-		sprintf(t_buf, "|------------------------------------------------|------|------|------|------|------|------|\r\n");
-		strcat(f_buf, t_buf);
-		
-		for(int i=0; i <nh ; i++) {
-			wmtrnet->GetName(i, buf);
-			if(strcmp(buf,"")==0) strcpy(buf,"No response from host");
-			
-			sprintf(t_buf, "|%40s - %4d | %4d | %4d | %4d | %4d | %4d | %4d |\r\n" ,
-					buf, wmtrnet->GetPercent(i),
-					wmtrnet->GetXmit(i), wmtrnet->GetReturned(i), wmtrnet->GetBest(i),
-					wmtrnet->GetAvg(i), wmtrnet->GetWorst(i), wmtrnet->GetLast(i));
-			strcat(f_buf, t_buf);
-		}
-		
-		sprintf(t_buf, "|________________________________________________|______|______|______|______|______|______|\r\n");
-		strcat(f_buf, t_buf);
-		
-		
-		CString cs_tmp((LPCSTR)IDS_STRING_SB_NAME);
-		strcat(f_buf, "   ");
-		strcat(f_buf, (LPCTSTR)cs_tmp);
-		
+		std::string textReport = BuildTextReport();
 		FILE* fp = fopen(dlg.GetPathName(), "wt");
 		if(fp != NULL) {
-			fprintf(fp, "%s", f_buf);
+			fprintf(fp, "%s", textReport.c_str());
 			fclose(fp);
 		}
 	}
@@ -764,43 +797,85 @@ void WinMTRDialog::OnEXPH()
 					this);
 					
 	if(dlg.DoModal() == IDOK) {
-	
-		char buf[255], t_buf[1000], f_buf[255*100];
-		
-		int nh = wmtrnet->GetMax();
-		
-		strcpy(f_buf, "<html><head><title>WinMTR Statistics</title></head><body bgcolor=\"white\">\r\n");
-		sprintf(t_buf, "<center><h2>WinMTR statistics</h2></center>\r\n");
-		strcat(f_buf, t_buf);
-		
-		sprintf(t_buf, "<p align=\"center\"> <table border=\"1\" align=\"center\">\r\n");
-		strcat(f_buf, t_buf);
-		
-		sprintf(t_buf, "<tr><td>Host</td> <td>%%</td> <td>Sent</td> <td>Recv</td> <td>Best</td> <td>Avrg</td> <td>Wrst</td> <td>Last</td></tr>\r\n");
-		strcat(f_buf, t_buf);
-		
-		for(int i=0; i <nh ; i++) {
-			wmtrnet->GetName(i, buf);
-			if(strcmp(buf,"")==0) strcpy(buf,"No response from host");
-			
-			sprintf(t_buf, "<tr><td>%s</td> <td>%4d</td> <td>%4d</td> <td>%4d</td> <td>%4d</td> <td>%4d</td> <td>%4d</td> <td>%4d</td></tr>\r\n" ,
-					buf, wmtrnet->GetPercent(i),
-					wmtrnet->GetXmit(i), wmtrnet->GetReturned(i), wmtrnet->GetBest(i),
-					wmtrnet->GetAvg(i), wmtrnet->GetWorst(i), wmtrnet->GetLast(i));
-			strcat(f_buf, t_buf);
-		}
-		
-		sprintf(t_buf, "</table></body></html>\r\n");
-		strcat(f_buf, t_buf);
-		
+		std::string htmlReport = BuildHtmlReport();
 		FILE* fp = fopen(dlg.GetPathName(), "wt");
 		if(fp != NULL) {
-			fprintf(fp, "%s", f_buf);
+			fprintf(fp, "%s", htmlReport.c_str());
 			fclose(fp);
 		}
 	}
 	
 	
+}
+
+std::string WinMTRDialog::BuildTextReport() const
+{
+	char buf[255];
+	char asn[64];
+	char line[1024];
+	std::ostringstream report;
+	int nh = wmtrnet->GetMax();
+
+	report << "|--------------------------------------------------------------------------------------------------------------|\r\n";
+	report << "|                                               WinMTR statistics                                              |\r\n";
+	report << "|                          Host                           - ASN        - %  | Sent | Recv | Best | Avrg | Wrst | Last |\r\n";
+	report << "|---------------------------------------------------------|------------|----|------|------|------|------|------|------|\r\n";
+
+	for(int i = 0; i < nh; ++i) {
+		wmtrnet->GetName(i, buf);
+		if(strcmp(buf, "") == 0) strcpy(buf, "No response from host");
+		wmtrnet->GetASN(i, asn);
+		if(strcmp(asn, "") == 0) strcpy(asn, "-");
+
+		sprintf(line, "|%57.57s | %-10.10s | %2d | %4d | %4d | %4d | %4d | %4d | %4d |\r\n",
+			buf,
+			asn,
+			wmtrnet->GetPercent(i),
+			wmtrnet->GetXmit(i),
+			wmtrnet->GetReturned(i),
+			wmtrnet->GetBest(i),
+			wmtrnet->GetAvg(i),
+			wmtrnet->GetWorst(i),
+			wmtrnet->GetLast(i));
+		report << line;
+	}
+
+	report << "|_________________________________________________________|____________|____|______|______|______|______|______|______|\r\n";
+	CString cs_tmp((LPCSTR)IDS_STRING_SB_NAME);
+	report << "   " << (LPCTSTR)cs_tmp;
+	return report.str();
+}
+
+std::string WinMTRDialog::BuildHtmlReport() const
+{
+	char buf[255];
+	char asn[64];
+	std::ostringstream report;
+	int nh = wmtrnet->GetMax();
+
+	report << "<html><head><title>WinMTR Statistics</title></head><body bgcolor=\"white\">\r\n";
+	report << "<center><h2>WinMTR statistics</h2></center>\r\n";
+	report << "<p align=\"center\"> <table border=\"1\" align=\"center\">\r\n";
+	report << "<tr><td>Host</td><td>ASN</td><td>%</td><td>Sent</td><td>Recv</td><td>Best</td><td>Avrg</td><td>Wrst</td><td>Last</td></tr>\r\n";
+
+	for(int i = 0; i < nh; ++i) {
+		wmtrnet->GetName(i, buf);
+		if(strcmp(buf, "") == 0) strcpy(buf, "No response from host");
+		wmtrnet->GetASN(i, asn);
+		if(strcmp(asn, "") == 0) strcpy(asn, "-");
+
+		report << "<tr><td>" << HtmlEscape(buf) << "</td><td>" << HtmlEscape(asn) << "</td><td>"
+			   << wmtrnet->GetPercent(i) << "</td><td>"
+			   << wmtrnet->GetXmit(i) << "</td><td>"
+			   << wmtrnet->GetReturned(i) << "</td><td>"
+			   << wmtrnet->GetBest(i) << "</td><td>"
+			   << wmtrnet->GetAvg(i) << "</td><td>"
+			   << wmtrnet->GetWorst(i) << "</td><td>"
+			   << wmtrnet->GetLast(i) << "</td></tr>\r\n";
+	}
+
+	report << "</table></body></html>\r\n";
+	return report.str();
 }
 
 
@@ -880,26 +955,109 @@ int WinMTRDialog::InitMTRNet()
 	sprintf(buf, "Resolving host %s...", hostname);
 	statusBar.SetPaneText(0,buf);
 	
-	addrinfo nfofilter= {0};
-	addrinfo* anfo;
-	if(wmtrnet->hasIPv6) {
-		switch(useIPv6) {
-		case 0:
-			nfofilter.ai_family=AF_INET; break;
-		case 1:
-			nfofilter.ai_family=AF_INET6; break;
-		default:
-			nfofilter.ai_family=AF_UNSPEC;
-		}
-	}
-	nfofilter.ai_socktype=SOCK_RAW;
-	nfofilter.ai_flags=AI_NUMERICSERV|AI_ADDRCONFIG;//|AI_V4MAPPED;
-	if(getaddrinfo(hostname,NULL,&nfofilter,&anfo)||!anfo) {
+	addrinfo* anfo = NULL;
+	if(!ResolveTarget(hostname, &anfo, false)) {
 		statusBar.SetPaneText(0, CString((LPCSTR)IDS_STRING_SB_NAME));
 		AfxMessageBox("Unable to resolve hostname.");
 		return 0;
 	}
 	freeaddrinfo(anfo);
+	return 1;
+}
+
+int WinMTRDialog::ResolveTarget(const char* hostname, addrinfo** result, bool showErrors)
+{
+	if(result) *result = NULL;
+	addrinfo nfofilter = {0};
+	if(wmtrnet->hasIPv6) {
+		switch(useIPv6) {
+		case 0:
+			nfofilter.ai_family = AF_INET; break;
+		case 1:
+			nfofilter.ai_family = AF_INET6; break;
+		default:
+			nfofilter.ai_family = AF_UNSPEC;
+		}
+	}
+	nfofilter.ai_socktype = SOCK_RAW;
+	nfofilter.ai_flags = AI_NUMERICSERV | AI_ADDRCONFIG;
+	if(getaddrinfo(hostname, NULL, &nfofilter, result) || !result || !*result) {
+		if(showErrors) {
+			AfxMessageBox("Unable to resolve hostname.");
+		}
+		return 0;
+	}
+	return 1;
+}
+
+int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeconds)
+{
+	addrinfo* anfo = NULL;
+	if(!ResolveTarget(hostname, &anfo, false)) {
+		std::string message = "Unable to resolve hostname: ";
+		message += hostname;
+		message += "\n";
+		WriteCliOutput(message.c_str());
+		return 0;
+	}
+
+	cli_trace_thread* trace = new cli_trace_thread;
+	trace->dialog = this;
+	trace->addressLength = GetSockaddrLength(anfo->ai_addr);
+	memset(&trace->address, 0, sizeof(trace->address));
+	memcpy(&trace->address, anfo->ai_addr, trace->addressLength);
+	freeaddrinfo(anfo);
+
+	DWORD waitTime = 0;
+	if(durationSeconds > 0) {
+		waitTime = durationSeconds * 1000;
+	} else if(cycles > 0) {
+		waitTime = (DWORD)(cycles * interval * 1000.0f);
+	}
+	if(waitTime == 0) waitTime = (DWORD)(10 * interval * 1000.0f);
+
+	HANDLE worker = (HANDLE)_beginthreadex(NULL, 0, CliTraceThread, trace, 0, NULL);
+	if(!worker) {
+		delete trace;
+		WriteCliOutput("Unable to start trace worker.\n");
+		return 0;
+	}
+
+	LONG previousStopState = InterlockedExchange(&g_cliStopRequested, 0);
+	SetConsoleCtrlHandler(CliConsoleHandler, TRUE);
+
+	DWORD startTick = GetTickCount();
+	int lastRenderedCycle = -1;
+	bool running = true;
+	while(running) {
+		Sleep(1000);
+		int currentCycle = wmtrnet->GetXmit(0);
+		DWORD elapsedMs = GetTickCount() - startTick;
+
+		std::string screen = BuildCliScreen(this, hostname, cycles, durationSeconds, elapsedMs);
+		if(ClearCliScreen()) {
+			WriteCliOutput(screen.c_str());
+		} else {
+			WriteCliOutput(screen.c_str());
+		}
+
+		if(InterlockedCompareExchange(&g_cliStopRequested, 0, 0) != 0) {
+			running = false;
+		} else if(durationSeconds > 0 && elapsedMs >= (DWORD)(durationSeconds * 1000)) {
+			running = false;
+		} else if(cycles > 0 && currentCycle >= cycles && currentCycle != lastRenderedCycle) {
+			running = false;
+		}
+		lastRenderedCycle = currentCycle;
+	}
+
+	wmtrnet->StopTrace();
+	WaitForSingleObject(worker, INFINITE);
+	CloseHandle(worker);
+	SetConsoleCtrlHandler(CliConsoleHandler, FALSE);
+	InterlockedExchange(&g_cliStopRequested, previousStopState);
+
+	WriteCliOutput("\r\n");
 	return 1;
 }
 
@@ -917,21 +1075,8 @@ void PingThread(void* p)
 	char hostname[255];
 	wmtrdlg->m_comboHost.GetWindowText(hostname, 255);
 	
-	addrinfo nfofilter= {0};
-	addrinfo* anfo;
-	if(wmtrdlg->wmtrnet->hasIPv6) {
-		switch(wmtrdlg->useIPv6) {
-		case 0:
-			nfofilter.ai_family=AF_INET; break;
-		case 1:
-			nfofilter.ai_family=AF_INET6; break;
-		default:
-			nfofilter.ai_family=AF_UNSPEC;
-		}
-	}
-	nfofilter.ai_socktype=SOCK_RAW;
-	nfofilter.ai_flags=AI_NUMERICSERV|AI_ADDRCONFIG;//|AI_V4MAPPED;
-	if(getaddrinfo(hostname,NULL,&nfofilter,&anfo)||!anfo) { //we use first address returned
+	addrinfo* anfo = NULL;
+	if(!wmtrdlg->ResolveTarget(hostname, &anfo, false)) { //we use first address returned
 		AfxMessageBox("Unable to resolve hostname. (again)");
 		ReleaseMutex(wmtrdlg->traceThreadMutex);
 		return;
@@ -939,6 +1084,16 @@ void PingThread(void* p)
 	wmtrdlg->wmtrnet->DoTrace(anfo->ai_addr);
 	freeaddrinfo(anfo);
 	ReleaseMutex(wmtrdlg->traceThreadMutex);
+}
+
+unsigned WINAPI CliTraceThread(void* p)
+{
+	cli_trace_thread* trace = (cli_trace_thread*)p;
+	WaitForSingleObject(trace->dialog->traceThreadMutex, INFINITE);
+	trace->dialog->wmtrnet->DoTrace((sockaddr*)&trace->address);
+	ReleaseMutex(trace->dialog->traceThreadMutex);
+	delete trace;
+	return 0;
 }
 
 

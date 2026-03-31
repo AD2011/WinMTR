@@ -18,6 +18,7 @@
 #include "WinMTRStatusBar.h"
 #include "WinMTRNet.h"
 #include "afxlinkctrl.h"
+#include <string>
 
 //*****************************************************************************
 // CLASS:  WinMTRDialog
@@ -71,7 +72,11 @@ public:
 	CButton	m_buttonExpH;
 	
 	int InitMTRNet();
-	
+	int ResolveTarget(const char* hostname, addrinfo** result, bool showErrors = true);
+	std::string BuildTextReport() const;
+	std::string BuildHtmlReport() const;
+	int RunCliTrace(const char* hostname, int cycles, int durationSeconds);
+
 	int DisplayRedraw();
 	void Transit(STATES new_state);
 	
