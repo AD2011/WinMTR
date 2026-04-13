@@ -242,7 +242,7 @@ void WinMTRMain::WriteConsoleText(const char* text) const
 void WinMTRMain::PrintHelp() const
 {
 	std::ostringstream help;
-	help << "WinMTR (Redux) command line usage:\n";
+	help << "WinMTR 2.0 command line usage:\n";
 	help << "  WinMTR.exe [options] host\n\n";
 	help << "Options:\n";
 	help << "  -h, --help               Show this help text.\n";

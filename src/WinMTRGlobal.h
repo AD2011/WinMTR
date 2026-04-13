@@ -50,7 +50,7 @@
 
 #include "resource.h"
 
-#define WINMTR_VERSION	"1.0"
+#define WINMTR_VERSION	"2.0"
 #define WINMTR_LICENSE	"GPLv2 - GNU General Public License, version 2"
 #define WINMTR_HOMEPAGE	"https://github.com/White-Tiger/WinMTR"
 

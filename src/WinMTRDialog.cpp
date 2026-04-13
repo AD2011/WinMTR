@@ -348,7 +348,7 @@ static std::string BuildCliScreen(WinMTRDialog* dialog, const char* hostname, in
 	}
 
 	screen << BuildCliSeparator('-');
-	screen << "   WinMTR v1.00 GPLv2 (original by Appnor MSP - Fully Managed Hosting & Cloud Provider)\r\n\r\n";
+	screen << "   WinMTR 2.0 GPLv2\r\n\r\n";
 
 	if(durationSeconds > 0) {
 		screen << "Elapsed: " << (elapsedMs / 1000) << "s / " << durationSeconds << "s";
@@ -461,9 +461,9 @@ BOOL WinMTRDialog::OnInitDialog()
 	}
 	
 #ifndef  _WIN64
-	char caption[] = {"WinMTR (Redux) v1.00 32bit"};
+	char caption[] = {"WinMTR 2.0 32bit"};
 #else
-	char caption[] = {"WinMTR (Redux) v1.00 64bit"};
+	char caption[] = {"WinMTR 2.0 64bit"};
 #endif
 	
 	SetTimer(1, WINMTR_DIALOG_TIMER, NULL);
@@ -483,12 +483,12 @@ BOOL WinMTRDialog::OnInitDialog()
 	statusBar.SetIndicators(sbi,1);
 	statusBar.SetPaneInfo(0, statusBar.GetItemID(0),SBPS_STRETCH, NULL);
 	
-	// create Appnor button
-	if(m_buttonAppnor.Create(_T("www.appnor.com"), WS_CHILD|WS_VISIBLE|WS_TABSTOP, CRect(0,0,0,0), &statusBar, 1234)) {
-		m_buttonAppnor.SetURL("http://appnor.com/?utm_source=winmtr&utm_medium=desktop&utm_campaign=software");
+	// create project link
+	if(m_buttonCredits.Create(_T("Credits"), WS_CHILD|WS_VISIBLE|WS_TABSTOP, CRect(0,0,0,0), &statusBar, 1234)) {
+		m_buttonCredits.SetURL("https://github.com/White-Tiger/WinMTR");
 		if(statusBar.AddPane(1234,1)) {
 			statusBar.SetPaneWidth(statusBar.CommandToIndex(1234),100);
-			statusBar.AddPaneControl(m_buttonAppnor,1234,true);
+			statusBar.AddPaneControl(m_buttonCredits,1234,true);
 		}
 	}
 	

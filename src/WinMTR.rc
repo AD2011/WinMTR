@@ -106,12 +106,12 @@ BEGIN
     EDITTEXT        IDC_EDIT_SIZE,196,99,34,13,ES_AUTOHSCROLL | ES_NUMBER
     CONTROL         "Resolve names",IDC_CHECK_DNS,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,167,119,63,8
     GROUPBOX        "",IDC_STATIC,7,7,237,82,BS_FLAT
-    CTEXT           "Get Fully Managed Dedicated and Cloud hosting in Europe and USA at killer prices.",IDC_STATIC,31,35,201,17
-    CTEXT           "WinMTR (Redux) v1.00 is offered under GPLv2",IDC_STATIC,42,14,194,17
+    CTEXT           "WinMTR 2.0 is offered under GPLv2.",IDC_STATIC,31,35,201,17
+    CTEXT           "WinMTR 2.0",IDC_STATIC,42,14,194,17
     PUSHBUTTON      "&License and Credits",ID_LICENSE,81,67,94,14,BS_FLAT
     LTEXT           "Max. hosts in LRU list:",IDC_STATIC,15,119,74,10,NOT WS_GROUP
     EDITTEXT        IDC_EDIT_MAX_LRU,90,116,34,13,ES_AUTOHSCROLL
-    LTEXT           "www.appnor.com",IDC_STATIC,102,51,60,11,NOT WS_GROUP
+    LTEXT           "https://github.com/White-Tiger/WinMTR",IDC_STATIC,68,51,120,11,NOT WS_GROUP
 END
 
 IDD_DIALOG_LICENSE DIALOGEX 0, 0, 175, 70
@@ -121,9 +121,9 @@ FONT 8, "MS Sans Serif", 0, 0, 0x0
 BEGIN
     DEFPUSHBUTTON   "OK",IDOK,62,36,50,14
     LTEXT           "Read more on",IDC_STATIC,36,21,46,8
-    LTEXT           "www.winmtr.net",IDC_STATIC,85,21,60,8
-    CTEXT           "WinMTR (Redux) is licensed under GPLv2.",IDC_STATIC,2,9,171,8,SS_CENTER
-    CTEXT           "https://github.com/White-Tiger/WinMTR",IDC_STATIC,7,57,161,8,SS_CENTER
+    LTEXT           "https://github.com/traviscross/mtr",IDC_STATIC,61,21,100,8
+    CTEXT           "WinMTR 2.0 is licensed under GPLv2.",IDC_STATIC,2,9,171,8,SS_CENTER
+    CTEXT           "Credits: Travis Cross, Dragos Manac, White-Tiger",IDC_STATIC,7,57,161,8,SS_CENTER
 END
 
 IDD_DIALOG_PROPERTIES DIALOG 0, 0, 282, 160
@@ -162,8 +162,8 @@ CAPTION "WinMTR"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
     DEFPUSHBUTTON   "OK",IDOK,144,101,50,14
-    LTEXT           "www.appnor.com",IDC_STATIC,187,9,60,11
-    LTEXT           "WinMTR (Redux) v1.00 is offered under GPLv2",IDC_STATIC,7,9,176,10
+    LTEXT           "https://github.com/White-Tiger/WinMTR",IDC_STATIC,151,9,96,11
+    LTEXT           "WinMTR 2.0 is offered under GPLv2",IDC_STATIC,7,9,136,10
     LTEXT           "Usage: WinMTR [options] target_host_name",IDC_STATIC,7,29,144,8
     LTEXT           "Options:",IDC_STATIC,7,39,28,8
     LTEXT           "     --interval, -i VALUE. Set ping interval.",IDC_STATIC,26,47,131,8
@@ -180,8 +180,8 @@ END
 //
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION 2,0,0,0
+ PRODUCTVERSION 2,0,0,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -196,13 +196,13 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "FileDescription", "WinMTR Redux (original by Appnor MSP - www.winmtr.net)"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileDescription", "WinMTR 2.0"
+            VALUE "FileVersion", "2.0.0.0"
             VALUE "InternalName", "WinMTR"
-            VALUE "LegalCopyright", "WinMTR 0.9 (c) 2010-2011 Appnor MSP - Fully Managed Hosting & Cloud Provider www.appnor.com"
+            VALUE "LegalCopyright", "GPLv2. Credits: Travis Cross, Dragos Manac, White-Tiger."
             VALUE "OriginalFilename", "WinMTR.exe"
             VALUE "ProductName", "WinMTR Application"
-            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "ProductVersion", "2.0.0.0"
         END
     END
     BLOCK "VarFileInfo"
@@ -278,7 +278,7 @@ END
 STRINGTABLE
 BEGIN
     IDP_SOCKETS_INIT_FAILED "Windows sockets initialization failed."
-    IDS_STRING_SB_NAME      "WinMTR v1.00 GPLv2 (original by Appnor MSP - Fully Managed Hosting & Cloud Provider)"
+    IDS_STRING_SB_NAME      "WinMTR 2.0 GPLv2"
     IDS_STRING_SB_PING      "0000000"
     IDS_STRING_CLEAR_HISTORY "Clear History"
 END
