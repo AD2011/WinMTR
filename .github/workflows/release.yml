@@ -1,0 +1,46 @@
+name: Build and Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        platform: [Win32, x64]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build ${{ matrix.platform }}
+        run: |
+          msbuild src\WinMTR.sln `
+            /p:Configuration=Release `
+            /p:Platform=${{ matrix.platform }} `
+            /p:PlatformToolset=v143 `
+            /m
+
+      - name: Locate executable
+        id: find_exe
+        shell: pwsh
+        run: |
+          if ("${{ matrix.platform }}" -eq "Win32") {
+            $exe = "src\Release\WinMTR.exe"
+            $name = "WinMTR-x86.exe"
+          } else {
+            $exe = "src\Release_x64\WinMTR.exe"
+            $name = "WinMTR-x64.exe"
+          }
+          Copy-Item $exe $name
+          echo "asset_name=$name" >> $env:GITHUB_OUTPUT
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.find_exe.outputs.asset_name }}
