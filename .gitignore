@@ -40,3 +40,5 @@ src/.vs/
 
 # Temporary build/test directories
 src/Release_x64_cli/
+
+DEVELOPMENT_HANDOFF.md
