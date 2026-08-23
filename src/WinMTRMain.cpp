@@ -218,13 +218,16 @@ bool WinMTRMain::SetupConsole() const
 		}
 	}
 
-	HANDLE conOut = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	// CONIN$/CONOUT$ must be opened with FILE_SHARE_READ | FILE_SHARE_WRITE:
+	// the console is shared with the shell that launched us (it keeps its own
+	// read/write handles open), and a narrower share mode can fail the open.
+	HANDLE conOut = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 	if(conOut != INVALID_HANDLE_VALUE) {
 		SetStdHandle(STD_OUTPUT_HANDLE, conOut);
 		SetStdHandle(STD_ERROR_HANDLE, conOut);
 	}
 
-	HANDLE conIn = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	HANDLE conIn = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 	if(conIn != INVALID_HANDLE_VALUE) {
 		SetStdHandle(STD_INPUT_HANDLE, conIn);
 	}
