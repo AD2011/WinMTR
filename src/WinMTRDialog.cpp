@@ -200,13 +200,17 @@ static void BeginCliInputSession()
 	g_cliSavedInputMode = true;
 
 	DWORD liveMode = inputMode;
-	// Keep ENABLE_PROCESSED_INPUT on so Ctrl+C is delivered as
-	// CTRL_C_EVENT to CliConsoleHandler (reliable locally and over
-	// SSH/ConPTY). Only suppress echo/line input so keystrokes do not
-	// smear the live display. The previous code cleared processed input,
-	// which broke Ctrl+C delivery and forced the GetAsyncKeyState /
-	// ReadConsoleInput fallbacks that never fire over SSH.
-	liveMode &= ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
+	// Clear ENABLE_PROCESSED_INPUT so Ctrl+C is reported in the input
+	// buffer as a KEY_EVENT (AsciiChar 0x03) that PollCliStopRequest reads
+	// via ReadConsoleInput. With processed input ON, Ctrl+C is diverted to
+	// a CTRL_C_EVENT that this attached-console Windows-subsystem app does
+	// not receive reliably - and returning TRUE from the handler then
+	// suppresses the default terminator, leaving the process unkillable
+	// (the regression where repeated Ctrl+C did nothing). Keeping it OFF
+	// makes ReadConsoleInput the reliable detector, locally and over
+	// SSH/ConPTY. Echo/line input are also cleared so typed keys do not
+	// smear the live display.
+	liveMode &= ~(ENABLE_PROCESSED_INPUT | ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
 	liveMode |= ENABLE_EXTENDED_FLAGS;
 	SetConsoleMode(input, liveMode);
 }
@@ -270,11 +274,58 @@ static bool ClearCliScreen()
 
 static bool PollCliStopRequest()
 {
-	// Stop is signalled exclusively by CliConsoleHandler now that
-	// ENABLE_PROCESSED_INPUT stays on. The GetAsyncKeyState path was
-	// per-desktop (stale/zero over SSH, false triggers from other
-	// windows) and ReadConsoleInput drained the buffer and ate keys, so
-	// both are removed.
+	// The console control handler (Ctrl+Break / session-close) sets the
+	// counter; check it first.
+	if(InterlockedCompareExchange(&g_cliStopCount, 0, 0) != 0) {
+		return true;
+	}
+
+	// With ENABLE_PROCESSED_INPUT cleared, Ctrl+C is delivered to the
+	// input buffer as a KEY_EVENT (AsciiChar 0x03, or VK 'C' with Ctrl
+	// held) rather than as a CTRL_C_EVENT. ReadConsoleInput is
+	// console-scoped, so this works locally and over SSH/ConPTY, unlike
+	// GetAsyncKeyState which is per-desktop and returns stale values over
+	// SSH. Drain pending events and look for an interrupt.
+	HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+	if(input == NULL || input == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+
+	DWORD eventCount = 0;
+	if(!GetNumberOfConsoleInputEvents(input, &eventCount) || eventCount == 0) {
+		return false;
+	}
+
+	INPUT_RECORD records[16];
+	DWORD recordsRead = 0;
+	while(eventCount > 0) {
+		DWORD batchSize = eventCount;
+		if(batchSize > (DWORD)(sizeof(records) / sizeof(records[0]))) {
+			batchSize = (DWORD)(sizeof(records) / sizeof(records[0]));
+		}
+		if(!ReadConsoleInput(input, records, batchSize, &recordsRead) || recordsRead == 0) {
+			break;
+		}
+		for(DWORD i = 0; i < recordsRead; ++i) {
+			const INPUT_RECORD& record = records[i];
+			if(record.EventType != KEY_EVENT) continue;
+			const KEY_EVENT_RECORD& key = record.Event.KeyEvent;
+			if(!key.bKeyDown) continue;
+			const DWORD ctrlState = key.dwControlKeyState;
+			const bool ctrlPressed = (ctrlState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
+			const char ascii = key.uChar.AsciiChar;
+			if(ascii == 0x03                                              // Ctrl+C (ETX)
+				|| (ctrlPressed && (ascii == 'c' || ascii == 'C' || key.wVirtualKeyCode == 'C'))
+				|| key.wVirtualKeyCode == VK_CANCEL) {                    // Ctrl+Break
+				InterlockedIncrement(&g_cliStopCount);
+				return true;
+			}
+		}
+		if(!GetNumberOfConsoleInputEvents(input, &eventCount)) {
+			break;
+		}
+	}
+
 	return InterlockedCompareExchange(&g_cliStopCount, 0, 0) != 0;
 }
 
@@ -1279,15 +1330,16 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 	wmtrnet->StopTrace();
 	// Bounded, pollable worker wait. Trace threads can be blocked inside
 	// IcmpSendEcho2 for up to ECHO_REPLY_TIMEOUT, so an INFINITE wait would
-	// ignore further Ctrl+C presses during that window (the "needs multiple
-	// Ctrl+C / won't close over SSH" symptom). Poll in slices: a second
-	// stop request, or a 3s hard cap, forces an immediate exit.
+	// ignore Ctrl+C during that window. Poll the input buffer in slices: a
+	// Ctrl+C (or repeat press) forces an immediate exit with the terminal
+	// restored; a 3s hard cap covers any hung worker. Natural completion
+	// (cycles/duration reached, no interrupt) drains gracefully here.
 	DWORD waitedMs = 0;
 	const DWORD sliceMs = 200;
 	const DWORD hardCapMs = 3000;
 	while(WaitForSingleObject(worker, sliceMs) == WAIT_TIMEOUT) {
 		waitedMs += sliceMs;
-		if(InterlockedCompareExchange(&g_cliStopCount, 0, 0) >= 2) {
+		if(PollCliStopRequest()) {
 			EndCliScreenSession();
 			ExitProcess(0);
 		}
