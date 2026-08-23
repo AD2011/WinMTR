@@ -41,4 +41,7 @@ src/.vs/
 # Temporary build/test directories
 src/Release_x64_cli/
 
+# Compiled test harness
+tests/ctrlc/CtrlCTest.exe
+
 DEVELOPMENT_HANDOFF.md

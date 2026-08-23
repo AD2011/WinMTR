@@ -205,27 +205,34 @@ void WinMTRMain::HideOwnedConsoleWindow() const
 
 bool WinMTRMain::SetupConsole() const
 {
-	HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-	if(output != NULL && output != INVALID_HANDLE_VALUE) return true;
-
+	// Do NOT short-circuit on a non-NULL GetStdHandle(STD_OUTPUT_HANDLE).
+	// A Windows-subsystem app launched from a terminal inherits pipe handles
+	// (from cmd, PowerShell, ConPTY, SSH) that are non-NULL but are NOT console
+	// handles. GetConsoleMode / SetConsoleMode / ReadConsoleInput all fail on
+	// them, so Ctrl+C detection and VT processing never work. We must always
+	// attach the parent's real console and bind CONIN$/CONOUT$ as the standard
+	// handles.
 	if(!AttachConsole(ATTACH_PARENT_PROCESS) && GetLastError() != ERROR_ACCESS_DENIED) {
 		if(!AllocConsole()) {
 			return false;
 		}
 	}
 
-	HANDLE conOut = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	// CONIN$/CONOUT$ must be opened with FILE_SHARE_READ | FILE_SHARE_WRITE:
+	// the console is shared with the shell that launched us (it keeps its own
+	// read/write handles open), and a narrower share mode can fail the open.
+	HANDLE conOut = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 	if(conOut != INVALID_HANDLE_VALUE) {
 		SetStdHandle(STD_OUTPUT_HANDLE, conOut);
 		SetStdHandle(STD_ERROR_HANDLE, conOut);
 	}
 
-	HANDLE conIn = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	HANDLE conIn = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 	if(conIn != INVALID_HANDLE_VALUE) {
 		SetStdHandle(STD_INPUT_HANDLE, conIn);
 	}
 
-	output = GetStdHandle(STD_OUTPUT_HANDLE);
+	HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
 	return output != NULL && output != INVALID_HANDLE_VALUE;
 }
 

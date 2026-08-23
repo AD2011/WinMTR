@@ -128,22 +128,37 @@ struct cli_trace_thread {
 	int addressLength;
 };
 
-static volatile LONG g_cliStopRequested = 0;
+static volatile LONG g_cliStopCount = 0;
 static bool g_cliUsingAltScreen = false;
 static bool g_cliUsingVirtualTerminal = false;
 static bool g_cliSavedInputMode = false;
 static DWORD g_cliOriginalInputMode = 0;
+static bool g_cliHaveDesiredInputMode = false;
+static DWORD g_cliDesiredInputMode = 0;
+
+static void EndCliScreenSession();  // forward: handler restores the terminal on session-close events
 
 static BOOL WINAPI CliConsoleHandler(DWORD signal)
 {
 	switch(signal) {
 	case CTRL_C_EVENT:
 	case CTRL_BREAK_EVENT:
+		// Counted stop request. Returning TRUE suppresses the default
+		// terminator so the trace loop can shut down gracefully; a second
+		// press escalates to a forced exit in RunCliTrace's worker wait.
+		InterlockedIncrement(&g_cliStopCount);
+		return TRUE;
 	case CTRL_CLOSE_EVENT:
 	case CTRL_LOGOFF_EVENT:
 	case CTRL_SHUTDOWN_EVENT:
-		InterlockedExchange(&g_cliStopRequested, 1);
-		return TRUE;
+		// The console/session is being torn down. Returning TRUE and then
+		// blocking inside the worker wait would linger the process - the
+		// exact "must kill the SSH shell to close it" symptom. Restore the
+		// terminal and exit immediately instead.
+		InterlockedIncrement(&g_cliStopCount);
+		EndCliScreenSession();
+		ExitProcess(0);
+		return TRUE;  // unreachable; ExitProcess does not return
 	default:
 		return FALSE;
 	}
@@ -187,8 +202,24 @@ static void BeginCliInputSession()
 	g_cliSavedInputMode = true;
 
 	DWORD liveMode = inputMode;
-	liveMode &= ~ENABLE_PROCESSED_INPUT;
-	liveMode |= ENABLE_EXTENDED_FLAGS;
+	// Force ENABLE_PROCESSED_INPUT ON. Because this is a Windows-subsystem
+	// executable, the interactive shell does NOT wait for it: the shell
+	// returns to its prompt and keeps a blocking console read pending for
+	// the whole trace. With processed input OFF, Ctrl+C is just a queued
+	// KEY_EVENT in the shared input buffer - and the shell's blocking read
+	// consumes it before our 100ms poll ever runs (PSReadLine treats it as
+	// CancelLine). With processed input ON, conhost never queues the key:
+	// it broadcasts CTRL_C_EVENT to every process attached to the console,
+	// which the shell cannot intercept, and CliConsoleHandler fires. This
+	// also works over SSH/ConPTY, where the 0x03 byte is converted by
+	// conhost using the same input-mode rules. PollCliStopRequest
+	// re-asserts this mode every poll because the shell resets the mode
+	// whenever it processes a keystroke of its own.
+	// Echo/line input are cleared so typed keys do not smear the display.
+	liveMode &= ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
+	liveMode |= ENABLE_PROCESSED_INPUT | ENABLE_EXTENDED_FLAGS;
+	g_cliDesiredInputMode = liveMode;
+	g_cliHaveDesiredInputMode = true;
 	SetConsoleMode(input, liveMode);
 }
 
@@ -203,6 +234,8 @@ static void EndCliInputSession()
 
 	g_cliSavedInputMode = false;
 	g_cliOriginalInputMode = 0;
+	g_cliHaveDesiredInputMode = false;
+	g_cliDesiredInputMode = 0;
 }
 
 static void BeginCliScreenSession()
@@ -251,12 +284,9 @@ static bool ClearCliScreen()
 
 static bool PollCliStopRequest()
 {
-	if(InterlockedCompareExchange(&g_cliStopRequested, 0, 0) != 0) {
-		return true;
-	}
-
-	if((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 && (GetAsyncKeyState('C') & 0x8000) != 0) {
-		InterlockedExchange(&g_cliStopRequested, 1);
+	// The console control handler (Ctrl+Break / session-close) sets the
+	// counter; check it first.
+	if(InterlockedCompareExchange(&g_cliStopCount, 0, 0) != 0) {
 		return true;
 	}
 
@@ -264,6 +294,23 @@ static bool PollCliStopRequest()
 	if(input == NULL || input == INVALID_HANDLE_VALUE) {
 		return false;
 	}
+
+	// Re-assert the CLI input mode (ENABLE_PROCESSED_INPUT on). The shell
+	// that launched us is still reading this console concurrently - it does
+	// not wait for a Windows-subsystem process - and it rewrites the input
+	// mode whenever it handles a keystroke. Processed input ON is what makes
+	// conhost turn Ctrl+C into a CTRL_C_EVENT broadcast (which reaches
+	// CliConsoleHandler no matter who is reading the input buffer) instead
+	// of a queued key event the shell can steal.
+	if(g_cliHaveDesiredInputMode) {
+		SetConsoleMode(input, g_cliDesiredInputMode);
+	}
+
+	// Secondary detector: drain any key events that did land in the input
+	// buffer (e.g. a Ctrl+C pressed in the brief window after the shell
+	// reset the mode and before the re-assert above) and look for 0x03 /
+	// Ctrl+C / Ctrl+Break. Also keeps typed keys from smearing the shell's
+	// hidden prompt underneath the live screen.
 
 	DWORD eventCount = 0;
 	if(!GetNumberOfConsoleInputEvents(input, &eventCount) || eventCount == 0) {
@@ -287,12 +334,11 @@ static bool PollCliStopRequest()
 			if(!key.bKeyDown) continue;
 			const DWORD ctrlState = key.dwControlKeyState;
 			const bool ctrlPressed = (ctrlState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
-			if(ctrlPressed && (key.uChar.AsciiChar == 'c' || key.uChar.AsciiChar == 'C' || key.wVirtualKeyCode == 'C')) {
-				InterlockedExchange(&g_cliStopRequested, 1);
-				return true;
-			}
-			if(key.wVirtualKeyCode == VK_CANCEL) {
-				InterlockedExchange(&g_cliStopRequested, 1);
+			const char ascii = key.uChar.AsciiChar;
+			if(ascii == 0x03                                              // Ctrl+C (ETX)
+				|| (ctrlPressed && (ascii == 'c' || ascii == 'C' || key.wVirtualKeyCode == 'C'))
+				|| key.wVirtualKeyCode == VK_CANCEL) {                    // Ctrl+Break
+				InterlockedIncrement(&g_cliStopCount);
 				return true;
 			}
 		}
@@ -301,10 +347,10 @@ static bool PollCliStopRequest()
 		}
 	}
 
-	return InterlockedCompareExchange(&g_cliStopRequested, 0, 0) != 0;
+	return InterlockedCompareExchange(&g_cliStopCount, 0, 0) != 0;
 }
 
-static std::string BuildCliScreen(WinMTRDialog* dialog, const char* hostname, int cycles, int durationSeconds, DWORD elapsedMs)
+static std::string BuildCliScreen(WinMTRDialog* dialog, const char* hostname, int cycles, int durationSeconds, DWORD elapsedMs, bool finalReport = false)
 {
 	char host[255];
 	char asn[64];
@@ -312,8 +358,12 @@ static std::string BuildCliScreen(WinMTRDialog* dialog, const char* hostname, in
 	int nh = dialog->wmtrnet->GetMax();
 	int currentCycle = dialog->wmtrnet->GetXmit(0);
 
-	screen << "WinMTR live report for " << hostname << "\r\n";
-	screen << "Press Ctrl+C to stop.\r\n\r\n";
+	if(finalReport) {
+		screen << "WinMTR report for " << hostname << "\r\n\r\n";
+	} else {
+		screen << "WinMTR live report for " << hostname << "\r\n";
+		screen << "Press Ctrl+C to stop.\r\n\r\n";
+	}
 	screen << BuildCliSeparator('-');
 	screen << "| " << CenterCell("WinMTR statistics", 105) << " |\r\n";
 	screen << BuildCliSeparator('-');
@@ -1271,7 +1321,10 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 		return 0;
 	}
 
-	LONG previousStopState = InterlockedExchange(&g_cliStopRequested, 0);
+	LONG previousStopCount = InterlockedExchange(&g_cliStopCount, 0);
+	// Clear any inherited "ignore Ctrl+C" flag (set when a parent used
+	// CREATE_NEW_PROCESS_GROUP) so CTRL_C_EVENT is actually delivered.
+	SetConsoleCtrlHandler(NULL, FALSE);
 	SetConsoleCtrlHandler(CliConsoleHandler, TRUE);
 	BeginCliScreenSession();
 
@@ -1303,13 +1356,38 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 	}
 
 	wmtrnet->StopTrace();
-	WaitForSingleObject(worker, INFINITE);
+	// Bounded, pollable worker wait. Trace threads can be blocked inside
+	// IcmpSendEcho2 for up to ECHO_REPLY_TIMEOUT, so an INFINITE wait would
+	// ignore Ctrl+C during that window. Poll the input buffer in slices: a
+	// Ctrl+C (or repeat press) forces an immediate exit with the terminal
+	// restored; a 3s hard cap covers any hung worker. Natural completion
+	// (cycles/duration reached, no interrupt) drains gracefully here.
+	DWORD waitedMs = 0;
+	const DWORD sliceMs = 200;
+	const DWORD hardCapMs = 3000;
+	// The live view runs on the VT alternate screen buffer, which vanishes
+	// when the session ends. Print a final snapshot of the results to the
+	// normal buffer on every exit path so they survive in scrollback (like
+	// `mtr --report`). Build it before leaving the screen session so the
+	// stats are as fresh as possible.
+	while(WaitForSingleObject(worker, sliceMs) == WAIT_TIMEOUT) {
+		waitedMs += sliceMs;
+		if(PollCliStopRequest() || waitedMs >= hardCapMs) {
+			std::string finalReport = BuildCliScreen(this, hostname, cycles, durationSeconds, GetTickCount() - startTick, true);
+			EndCliScreenSession();
+			WriteCliOutput("\r\n");
+			WriteCliOutput(finalReport.c_str());
+			ExitProcess(0);
+		}
+	}
 	CloseHandle(worker);
+	std::string finalReport = BuildCliScreen(this, hostname, cycles, durationSeconds, GetTickCount() - startTick, true);
 	EndCliScreenSession();
 	SetConsoleCtrlHandler(CliConsoleHandler, FALSE);
-	InterlockedExchange(&g_cliStopRequested, previousStopState);
+	InterlockedExchange(&g_cliStopCount, previousStopCount);
 
 	WriteCliOutput("\r\n");
+	WriteCliOutput(finalReport.c_str());
 	return 1;
 }
 
