@@ -205,9 +205,13 @@ void WinMTRMain::HideOwnedConsoleWindow() const
 
 bool WinMTRMain::SetupConsole() const
 {
-	HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-	if(output != NULL && output != INVALID_HANDLE_VALUE) return true;
-
+	// Do NOT short-circuit on a non-NULL GetStdHandle(STD_OUTPUT_HANDLE).
+	// A Windows-subsystem app launched from a terminal inherits pipe handles
+	// (from cmd, PowerShell, ConPTY, SSH) that are non-NULL but are NOT console
+	// handles. GetConsoleMode / SetConsoleMode / ReadConsoleInput all fail on
+	// them, so Ctrl+C detection and VT processing never work. We must always
+	// attach the parent's real console and bind CONIN$/CONOUT$ as the standard
+	// handles.
 	if(!AttachConsole(ATTACH_PARENT_PROCESS) && GetLastError() != ERROR_ACCESS_DENIED) {
 		if(!AllocConsole()) {
 			return false;
@@ -225,7 +229,7 @@ bool WinMTRMain::SetupConsole() const
 		SetStdHandle(STD_INPUT_HANDLE, conIn);
 	}
 
-	output = GetStdHandle(STD_OUTPUT_HANDLE);
+	HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
 	return output != NULL && output != INVALID_HANDLE_VALUE;
 }
 
