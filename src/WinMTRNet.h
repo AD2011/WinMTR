@@ -93,7 +93,7 @@ public:
 		in6_addr last_remote_addr6;
 	};
 	bool				hasIPv6;
-	bool				tracing;
+	volatile bool		tracing;
 	bool				initialized;
 	HANDLE				hICMP;
 	HANDLE				hICMP6;
