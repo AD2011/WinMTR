@@ -585,15 +585,36 @@ void WinMTRNet::SetErrorName(int at, DWORD errnum)
 void WinMTRNet::UpdateRTT(int at, int rtt)
 {
 	WaitForSingleObject(ghMutex, INFINITE);
-	host[at].last=rtt;
-	host[at].total+=rtt;
-	if(host[at].best>rtt || host[at].xmit==1)
-		host[at].best=rtt;
-	if(host[at].worst<rtt)
-		host[at].worst=rtt;
+	// Welford's online algorithm for running variance.
+	// UpdateRTT is called BEFORE AddReturned, so host[at].returned is the
+	// count of *previous* replies. total has already been incremented below.
+	int prevCount = host[at].returned;
+	host[at].total += rtt;
+	host[at].last = rtt;
+	if(host[at].best > rtt || prevCount == 0)
+		host[at].best = rtt;
+	if(host[at].worst < rtt)
+		host[at].worst = rtt;
+	if(prevCount > 0) {
+		double oldMean = (double)(host[at].total - rtt) / prevCount;
+		double newMean = (double)host[at].total / (prevCount + 1);
+		double delta = rtt - oldMean;
+		host[at].m2 += delta * (rtt - newMean);
+	}
 	ReleaseMutex(ghMutex);
 }
 
+int WinMTRNet::GetStDev(int at)
+{
+	WaitForSingleObject(ghMutex, INFINITE);
+	int n = host[at].returned;
+	int ret = 0;
+	if(n > 1) {
+		ret = (int)(sqrt(host[at].m2 / (n - 1)) + 0.5);
+	}
+	ReleaseMutex(ghMutex);
+	return ret;
+}
 void WinMTRNet::AddReturned(int at)
 {
 	WaitForSingleObject(ghMutex, INFINITE);

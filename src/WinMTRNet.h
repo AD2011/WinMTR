@@ -33,6 +33,7 @@ struct s_nethost {
 	int xmit;			// number of PING packets sent
 	int returned;		// number of ICMP echo replies received
 	unsigned long total;	// total time
+	double m2;			// Welford's M2 for running variance (StDev)
 	int last;				// last time
 	int best;				// best time
 	int worst;			// worst time
@@ -73,6 +74,7 @@ public:
 	int		GetWorst(int at);
 	int		GetAvg(int at);
 	int		GetPercent(int at);
+	int		GetStDev(int at);
 	int		GetLast(int at);
 	int		GetReturned(int at);
 	int		GetXmit(int at);

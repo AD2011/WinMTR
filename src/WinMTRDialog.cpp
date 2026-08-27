@@ -85,41 +85,87 @@ static std::string CenterCell(const std::string& value, size_t width)
 	return text;
 }
 
-static std::string BuildCliSeparator(char fill)
+// --- mtr-style CLI formatting helpers ---
+
+static const int MTR_HOST_WIDTH = 72;
+static const int MTR_W_LOSS = 6;
+static const int MTR_W_SNT = 4;
+static const int MTR_W_LAST = 6;
+static const int MTR_W_AVG = 6;
+static const int MTR_W_BEST = 5;
+static const int MTR_W_WRST = 6;
+static const int MTR_W_STDEV = 5;
+
+static std::string FormatTimestamp()
 {
-	static const size_t widths[] = {57, 10, 4, 4, 4, 4, 4, 4, 4};
-	std::ostringstream row;
-	row << '|';
-	for(size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
-		row << std::string(widths[i] + 2, fill) << '|';
-	}
-	row << "\r\n";
-	return row.str();
+	time_t now = time(NULL);
+	struct tm tmv;
+	localtime_s(&tmv, &now);
+	char buf[32];
+	strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &tmv);
+	return std::string(buf);
 }
 
-static std::string BuildCliRow(
-	const std::string& host,
-	const std::string& asn,
-	int loss,
-	int sent,
-	int recv,
-	int best,
-	int avrg,
-	int wrst,
-	int last)
+static std::string FormatSockaddr(const sockaddr* addr)
 {
-	std::ostringstream row;
-	row << "| " << PadCell(host, 57, false)
-		<< " | " << PadCell(asn, 10, false)
-		<< " | " << PadCell(std::to_string(loss), 4, true)
-		<< " | " << PadCell(std::to_string(sent), 4, true)
-		<< " | " << PadCell(std::to_string(recv), 4, true)
-		<< " | " << PadCell(std::to_string(best), 4, true)
-		<< " | " << PadCell(std::to_string(avrg), 4, true)
-		<< " | " << PadCell(std::to_string(wrst), 4, true)
-		<< " | " << PadCell(std::to_string(last), 4, true)
-		<< " |\r\n";
-	return row.str();
+	char buf[NI_MAXHOST];
+	if(!getnameinfo(addr, GetSockaddrLength(addr), buf, NI_MAXHOST, NULL, 0, NI_NUMERICHOST)) {
+		return std::string(buf);
+	}
+	return "";
+}
+
+static std::string GetSourceIP(const sockaddr* destAddr)
+{
+	SOCKET s = socket(destAddr->sa_family, SOCK_DGRAM, 0);
+	if(s == INVALID_SOCKET) return "";
+	if(connect(s, destAddr, GetSockaddrLength(destAddr)) == SOCKET_ERROR) {
+		closesocket(s);
+		return "";
+	}
+	sockaddr_storage src;
+	int srcLen = sizeof(src);
+	std::string result;
+	if(getsockname(s, (sockaddr*)&src, &srcLen) == 0) {
+		result = FormatSockaddr((sockaddr*)&src);
+	}
+	closesocket(s);
+	return result;
+}
+
+static std::string GetSourceHostname()
+{
+	char buf[NI_MAXHOST];
+	if(gethostname(buf, NI_MAXHOST) == 0) return std::string(buf);
+	return "";
+}
+
+static std::string FormatLoss(int xmit, int returned)
+{
+	if(xmit == 0) return " 0.0%";
+	char buf[16];
+	sprintf(buf, "%4.1f%%", 100.0 * (xmit - returned) / xmit);
+	return std::string(buf);
+}
+
+static std::string FormatRtt(int ms)
+{
+	char buf[16];
+	sprintf(buf, "%.1f", (double)ms);
+	return std::string(buf);
+}
+
+static std::string FormatStats(WinMTRDialog* dialog, int at)
+{
+	std::ostringstream stats;
+	stats << PadCell(FormatLoss(dialog->wmtrnet->GetXmit(at), dialog->wmtrnet->GetReturned(at)), MTR_W_LOSS, true) << "  "
+		  << PadCell(std::to_string(dialog->wmtrnet->GetXmit(at)), MTR_W_SNT, true) << "  "
+		  << PadCell(FormatRtt(dialog->wmtrnet->GetLast(at)), MTR_W_LAST, true) << "  "
+		  << PadCell(FormatRtt(dialog->wmtrnet->GetAvg(at)), MTR_W_AVG, true) << "  "
+		  << PadCell(FormatRtt(dialog->wmtrnet->GetBest(at)), MTR_W_BEST, true) << "  "
+		  << PadCell(FormatRtt(dialog->wmtrnet->GetWorst(at)), MTR_W_WRST, true) << "  "
+		  << PadCell(FormatRtt(dialog->wmtrnet->GetStDev(at)), MTR_W_STDEV, true);
+	return stats.str();
 }
 
 struct cli_trace_thread {
@@ -263,7 +309,7 @@ static void EndCliScreenSession()
 static bool ClearCliScreen()
 {
 	if(g_cliUsingVirtualTerminal) {
-		WriteCliOutput("\x1b[H\x1b[2J");
+		WriteCliOutput("\x1b[H\x1b[0J");
 		return true;
 	}
 
@@ -350,64 +396,63 @@ static bool PollCliStopRequest()
 	return InterlockedCompareExchange(&g_cliStopCount, 0, 0) != 0;
 }
 
-static std::string BuildCliScreen(WinMTRDialog* dialog, const char* hostname, int cycles, int durationSeconds, DWORD elapsedMs, bool finalReport = false)
+static std::string BuildCliScreen(WinMTRDialog* dialog, const char* hostname,
+	const std::string& sourceHost, const std::string& sourceIP, const std::string& destIP,
+	int /*cycles*/, int /*durationSeconds*/, DWORD /*elapsedMs*/, bool /*finalReport*/)
 {
 	char host[255];
 	char asn[64];
 	std::ostringstream screen;
 	int nh = dialog->wmtrnet->GetMax();
-	int currentCycle = dialog->wmtrnet->GetXmit(0);
 
-	if(finalReport) {
-		screen << "WinMTR report for " << hostname << "\r\n\r\n";
-	} else {
-		screen << "WinMTR live report for " << hostname << "\r\n";
-		screen << "Press Ctrl+C to stop.\r\n\r\n";
-	}
-	screen << BuildCliSeparator('-');
-	screen << "| " << CenterCell("WinMTR statistics", 105) << " |\r\n";
-	screen << BuildCliSeparator('-');
-	screen << "| " << CenterCell("Host", 57)
-		   << " | " << CenterCell("ASN", 10)
-		   << " | " << CenterCell("%", 4)
-		   << " | " << CenterCell("Sent", 4)
-		   << " | " << CenterCell("Recv", 4)
-		   << " | " << CenterCell("Best", 4)
-		   << " | " << CenterCell("Avrg", 4)
-		   << " | " << CenterCell("Wrst", 4)
-		   << " | " << CenterCell("Last", 4)
-		   << " |\r\n";
-	screen << BuildCliSeparator('-');
+	// Header — matches `mtr` default display
+	screen << "My traceroute  [WinMTR 2.0]\r\n";
 
+	// Source -> Dest line with right-aligned timestamp
+	std::string srcDst = sourceHost + " (" + sourceIP + ") -> " + hostname + " (" + destIP + ")";
+	std::string ts = FormatTimestamp();
+	int padWidth = 80 - (int)srcDst.length() - (int)ts.length();
+	if(padWidth < 2) padWidth = 2;
+	screen << srcDst << std::string(padWidth, ' ') << ts << "\r\n";
+
+	screen << "Keys:  Help   Display mode   Restart statistics   Order of fields   quit\r\n";
+
+	// Column group labels (Packets / Pings)
+	int packetsWidth = MTR_W_LOSS + 2 + MTR_W_SNT;
+	int pingsWidth = MTR_W_LAST + 2 + MTR_W_AVG + 2 + MTR_W_BEST + 2 + MTR_W_WRST + 2 + MTR_W_STDEV;
+	screen << PadCell("", MTR_HOST_WIDTH) << CenterCell("Packets", packetsWidth) << CenterCell("Pings", pingsWidth) << "\r\n";
+
+	// Column header line
+	screen << PadCell(" Host", MTR_HOST_WIDTH)
+		   << PadCell("Loss%", MTR_W_LOSS, true) << "  "
+		   << PadCell("Snt", MTR_W_SNT, true) << "  "
+		   << PadCell("Last", MTR_W_LAST, true) << "  "
+		   << PadCell("Avg", MTR_W_AVG, true) << "  "
+		   << PadCell("Best", MTR_W_BEST, true) << "  "
+		   << PadCell("Wrst", MTR_W_WRST, true) << "  "
+		   << PadCell("StDev", MTR_W_STDEV, true) << "\r\n";
+
+	// Hop rows
 	for(int i = 0; i < nh; ++i) {
 		dialog->wmtrnet->GetName(i, host);
-		if(strcmp(host, "") == 0) strcpy(host, "No response from host");
 		dialog->wmtrnet->GetASN(i, asn);
-		if(strcmp(asn, "") == 0) strcpy(asn, "-");
 
-		screen << BuildCliRow(
-			host,
-			asn,
-			dialog->wmtrnet->GetPercent(i),
-			dialog->wmtrnet->GetXmit(i),
-			dialog->wmtrnet->GetReturned(i),
-			dialog->wmtrnet->GetBest(i),
-			dialog->wmtrnet->GetAvg(i),
-			dialog->wmtrnet->GetWorst(i),
-			dialog->wmtrnet->GetLast(i));
+		int returned = dialog->wmtrnet->GetReturned(i);
+		if(returned == 0) {
+			// No replies yet — mtr shows "(waiting for reply)" with no stats
+			char num[8];
+			sprintf(num, "%2d.", i + 1);
+			screen << num << " (waiting for reply)\r\n";
+		} else {
+			std::string asnStr = (asn[0] != '\0') ? asn : "AS???";
+			char hopAsn[32];
+			sprintf(hopAsn, "%2d. %-7s  ", i + 1, asnStr.c_str());
+			std::string hostEntry = std::string(hopAsn) + host;
+			screen << PadCell(hostEntry, MTR_HOST_WIDTH, false)
+				   << FormatStats(dialog, i) << "\r\n";
+		}
 	}
 
-	screen << BuildCliSeparator('-');
-	screen << "   WinMTR 2.0 GPLv2\r\n\r\n";
-
-	if(durationSeconds > 0) {
-		screen << "Elapsed: " << (elapsedMs / 1000) << "s / " << durationSeconds << "s";
-	} else if(cycles > 0) {
-		screen << "Cycles: " << currentCycle << " / " << cycles;
-	} else {
-		screen << "Cycles: " << currentCycle;
-	}
-	screen << "\r\n";
 	return screen.str();
 }
 
@@ -1304,8 +1349,13 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 	trace->addressLength = GetSockaddrLength(anfo->ai_addr);
 	memset(&trace->address, 0, sizeof(trace->address));
 	memcpy(&trace->address, anfo->ai_addr, trace->addressLength);
-	freeaddrinfo(anfo);
 
+	// Compute source/dest info for the mtr-style header (once, before the loop)
+	std::string sourceHost = GetSourceHostname();
+	std::string sourceIP = GetSourceIP((sockaddr*)&trace->address);
+	std::string destIP = FormatSockaddr((sockaddr*)&trace->address);
+	if(sourceIP.empty()) sourceIP = "0.0.0.0";
+	if(destIP.empty()) destIP = hostname;
 	DWORD waitTime = 0;
 	if(durationSeconds > 0) {
 		waitTime = durationSeconds * 1000;
@@ -1341,7 +1391,7 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 		int currentCycle = wmtrnet->GetXmit(0);
 		DWORD elapsedMs = GetTickCount() - startTick;
 
-		std::string screen = BuildCliScreen(this, hostname, cycles, durationSeconds, elapsedMs);
+		std::string screen = BuildCliScreen(this, hostname, sourceHost, sourceIP, destIP, cycles, durationSeconds, elapsedMs, false);
 		ClearCliScreen();
 		WriteCliOutput(screen.c_str());
 
@@ -1373,7 +1423,7 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 	while(WaitForSingleObject(worker, sliceMs) == WAIT_TIMEOUT) {
 		waitedMs += sliceMs;
 		if(PollCliStopRequest() || waitedMs >= hardCapMs) {
-			std::string finalReport = BuildCliScreen(this, hostname, cycles, durationSeconds, GetTickCount() - startTick, true);
+		std::string finalReport = BuildCliScreen(this, hostname, sourceHost, sourceIP, destIP, cycles, durationSeconds, GetTickCount() - startTick, true);
 			EndCliScreenSession();
 			WriteCliOutput("\r\n");
 			WriteCliOutput(finalReport.c_str());
@@ -1381,7 +1431,7 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 		}
 	}
 	CloseHandle(worker);
-	std::string finalReport = BuildCliScreen(this, hostname, cycles, durationSeconds, GetTickCount() - startTick, true);
+	std::string finalReport = BuildCliScreen(this, hostname, sourceHost, sourceIP, destIP, cycles, durationSeconds, GetTickCount() - startTick, true);
 	EndCliScreenSession();
 	SetConsoleCtrlHandler(CliConsoleHandler, FALSE);
 	InterlockedExchange(&g_cliStopCount, previousStopCount);
