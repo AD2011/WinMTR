@@ -98,6 +98,8 @@ public:
 	bool				hasUseDNSFromCmdLine;
 	unsigned char		useIPv6;
 	bool				hasUseIPv6FromCmdLine;
+	int					probeMode;		// ProbeMode: ICMP (default), TCP, UDP
+	int					targetPort;		// -P/--port; 0 = per-mode default (TCP 80, UDP 33434)
 	WinMTRNet*			wmtrnet;
 	
 	void SetHostName(const char* host);

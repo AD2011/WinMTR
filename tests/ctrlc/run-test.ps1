@@ -19,7 +19,8 @@ param(
     [string]$TargetExe = '',
     [string]$TargetArgs = '1.1.1.1 -n',
     [int]$Settle = 5,
-    [int]$Presses = 3
+    [int]$Presses = 3,
+    [int]$KeyByte = 3    # 3 = Ctrl+C; 113 = 'q'; use for interactive-key tests
 )
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $TargetExe) {
@@ -42,7 +43,7 @@ if (-not (Test-Path $harness) -or (Get-Item $source).LastWriteTime -gt (Get-Item
 # Windows duplicates the pipe handles into console-subsystem children even
 # with bInheritHandles=FALSE, which breaks the pseudoconsole scenario.
 Remove-Item (Join-Path $here 'harness.log') -ErrorAction SilentlyContinue
-$argList = @($Mode, ('"' + $TargetExe + '"'), ('"' + $TargetArgs + '"'), $Settle, $Presses)
+$argList = @($Mode, ('"' + $TargetExe + '"'), ('"' + $TargetArgs + '"'), $Settle, $Presses, $KeyByte)
 $p = Start-Process -FilePath $harness -ArgumentList $argList -WindowStyle Hidden -Wait -PassThru
 Get-Content (Join-Path $here 'harness.log') -ErrorAction SilentlyContinue
 Write-Output ("VERDICT_EXITCODE=" + $p.ExitCode + " (0=PASS ctrl+c exits, 1=FAIL still running, 2=setup error)")
