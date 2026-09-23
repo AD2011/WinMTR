@@ -133,6 +133,401 @@ static bool LookupAsn(const sockaddr* addr, std::string& asn)
 unsigned WINAPI TraceThread(void* p);
 unsigned WINAPI TraceThread6(void* p);
 void DnsResolverThread(void* p);
+static unsigned WINAPI IcmpListenerThread(void* p);
+static unsigned WINAPI TcpProbeThread(void* p);
+static unsigned WINAPI UdpProbeThread(void* p);
+
+// ---------------------------------------------------------------------------
+// TCP/UDP probe engine (PARITY_PLAN.md P1). IPv4 only for now.
+//
+// Windows cannot send raw TCP (blocked since XP SP2), so TCP SYN probes are
+// real non-blocking connect() calls on sockets with IP_TTL set - the OS emits
+// the SYN with our TTL. UDP probes are plain sendto on TTL-limited sockets.
+// Intermediate hops answer with ICMP TTL-exceeded, captured on one shared raw
+// ICMP socket (requires Administrator - non-elevated raw sockets bind but are
+// silently starved of traffic) and matched back to the probe by the source
+// port embedded in the ICMP error payload. Final hop: TCP - connect completes
+// (SYN-ACK) or is refused (RST); UDP - ICMP port-unreachable from the target.
+//
+// File-scope state: the app has exactly one WinMTRNet instance and one trace
+// at a time (traceThreadMutex serializes GUI restarts).
+// ---------------------------------------------------------------------------
+
+struct pending_probe {
+	USHORT			srcPort;	// host order; 0 = slot free
+	LARGE_INTEGER	sendTime;
+	HANDLE			event;		// manual-reset, signaled by the listener
+	u_long			gateway;	// responder address (network order)
+	int				rttMs;
+	int				icmpType;
+	int				icmpCode;
+};
+
+static pending_probe		g_probeTable[MAX_HOPS];
+static CRITICAL_SECTION		g_probeLock;
+static bool					g_probeLockInit = false;
+static SOCKET				g_rawIcmpSocket = INVALID_SOCKET;
+static in_addr				g_probeSrcAddr;
+static in_addr				g_probeDstAddr;
+
+static int ElapsedMs(const LARGE_INTEGER& since)
+{
+	LARGE_INTEGER now, freq;
+	QueryPerformanceCounter(&now);
+	QueryPerformanceFrequency(&freq);
+	return (int)((now.QuadPart - since.QuadPart) * 1000 / freq.QuadPart);
+}
+
+static unsigned WINAPI IcmpListenerThread(void* p)
+{
+	WinMTRNet* wmtrnet = (WinMTRNet*)p;
+	unsigned char buf[2048];
+
+	while(wmtrnet->tracing) {
+		fd_set readfds;
+		FD_ZERO(&readfds);
+		FD_SET(g_rawIcmpSocket, &readfds);
+		timeval tv = {0, 200000};	// 200ms slices so StopTrace is honored
+		int sel = select(0, &readfds, NULL, NULL, &tv);
+		if(sel == SOCKET_ERROR) break;		// socket closed under us
+		if(sel == 0) continue;
+
+		int n = recv(g_rawIcmpSocket, (char*)buf, sizeof(buf), 0);
+		if(n == SOCKET_ERROR || n <= 0) break;
+
+		// buf: outer IPv4 header | ICMP header | inner IPv4 header | first 8
+		// bytes of the original transport header (enough for the ports).
+		if(n < 20) continue;
+		int outerIhl = (buf[0] & 0x0F) * 4;
+		if(n < outerIhl + 8 + 20 + 4) continue;
+		unsigned char type = buf[outerIhl];
+		unsigned char code = buf[outerIhl + 1];
+		if(type != 11 && type != 3) continue;	// TTL exceeded / unreachable
+
+		int inner = outerIhl + 8;
+		int innerIhl = (buf[inner] & 0x0F) * 4;
+		if(n < inner + innerIhl + 4) continue;
+		unsigned char innerProto = buf[inner + 9];
+		if(innerProto != IPPROTO_TCP && innerProto != IPPROTO_UDP) continue;
+
+		// Only errors about probes aimed at our current target.
+		u_long innerDst;
+		memcpy(&innerDst, buf + inner + 16, 4);
+		if(innerDst != g_probeDstAddr.s_addr) continue;
+
+		USHORT sport = (USHORT)((buf[inner + innerIhl] << 8) | buf[inner + innerIhl + 1]);
+		u_long gateway;
+		memcpy(&gateway, buf + 12, 4);	// outer source = the responding hop
+
+		EnterCriticalSection(&g_probeLock);
+		for(int i = 0; i < MAX_HOPS; ++i) {
+			if(g_probeTable[i].srcPort == sport) {
+				g_probeTable[i].gateway = gateway;
+				g_probeTable[i].icmpType = type;
+				g_probeTable[i].icmpCode = code;
+				g_probeTable[i].rttMs = ElapsedMs(g_probeTable[i].sendTime);
+				g_probeTable[i].srcPort = 0;	// claimed
+				SetEvent(g_probeTable[i].event);
+				break;
+			}
+		}
+		LeaveCriticalSection(&g_probeLock);
+	}
+	return 0;
+}
+
+// Registers the probe in the table (before the packet leaves, so a fast
+// reply cannot race the registration).
+static void RegisterProbe(int hop, USHORT srcPortHostOrder)
+{
+	EnterCriticalSection(&g_probeLock);
+	ResetEvent(g_probeTable[hop].event);
+	QueryPerformanceCounter(&g_probeTable[hop].sendTime);
+	g_probeTable[hop].gateway = 0;
+	g_probeTable[hop].rttMs = 0;
+	g_probeTable[hop].icmpType = 0;
+	g_probeTable[hop].icmpCode = 0;
+	g_probeTable[hop].srcPort = srcPortHostOrder;
+	LeaveCriticalSection(&g_probeLock);
+}
+
+static void UnregisterProbe(int hop)
+{
+	EnterCriticalSection(&g_probeLock);
+	g_probeTable[hop].srcPort = 0;
+	LeaveCriticalSection(&g_probeLock);
+}
+
+// Map an ICMP destination-unreachable code to the IP_* status naming used by
+// SetErrorName.
+static DWORD UnreachableCodeToIpStatus(int code)
+{
+	switch(code) {
+	case 0:  return IP_DEST_NET_UNREACHABLE;
+	case 1:  return IP_DEST_HOST_UNREACHABLE;
+	case 2:  return IP_DEST_PROT_UNREACHABLE;
+	case 3:  return IP_DEST_PORT_UNREACHABLE;
+	default: return IP_DEST_HOST_UNREACHABLE;
+	}
+}
+
+static void PaceProbe(WinMTRNet* wmtrnet, DWORD probeStartTick)
+{
+	DWORD intervalMs = (DWORD)(wmtrnet->wmtrdlg->interval * 1000);
+	DWORD spent = GetTickCount() - probeStartTick;
+	if(spent < intervalMs) {
+		InterruptibleTraceSleep(wmtrnet, intervalMs - spent);
+	}
+}
+
+static unsigned WINAPI TcpProbeThread(void* p)
+{
+	trace_thread* current = (trace_thread*)p;
+	WinMTRNet* wmtrnet = current->winmtr;
+	const int hop = current->ttl - 1;
+	const USHORT port = (USHORT)(wmtrnet->wmtrdlg->targetPort > 0 ? wmtrnet->wmtrdlg->targetPort : 80);
+
+	while(wmtrnet->tracing) {
+		if(current->ttl > wmtrnet->GetMax()) break;
+		DWORD probeStartTick = GetTickCount();
+
+		SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if(s == INVALID_SOCKET) break;
+		int ttl = current->ttl;
+		setsockopt(s, IPPROTO_IP, IP_TTL, (char*)&ttl, sizeof(ttl));
+
+		sockaddr_in local;
+		memset(&local, 0, sizeof(local));
+		local.sin_family = AF_INET;
+		local.sin_addr = g_probeSrcAddr;
+		bind(s, (sockaddr*)&local, sizeof(local));
+		sockaddr_in bound;
+		int boundLen = sizeof(bound);
+		getsockname(s, (sockaddr*)&bound, &boundLen);
+
+		u_long nonBlocking = 1;
+		ioctlsocket(s, FIONBIO, &nonBlocking);
+
+		RegisterProbe(hop, ntohs(bound.sin_port));
+
+		sockaddr_in dst;
+		memset(&dst, 0, sizeof(dst));
+		dst.sin_family = AF_INET;
+		dst.sin_addr = current->address;
+		dst.sin_port = htons(port);
+		connect(s, (sockaddr*)&dst, sizeof(dst));	// WSAEWOULDBLOCK expected
+		wmtrnet->AddXmit(hop);
+
+		bool resolved = false;
+		DWORD waited = 0;
+		const DWORD sliceMs = 25;
+		while(waited < ECHO_REPLY_TIMEOUT && wmtrnet->tracing && !resolved) {
+			// Intermediate hop / unreachable reported by the ICMP listener?
+			if(WaitForSingleObject(g_probeTable[hop].event, 0) == WAIT_OBJECT_0) {
+				wmtrnet->UpdateRTT(hop, g_probeTable[hop].rttMs);
+				wmtrnet->AddReturned(hop);
+				wmtrnet->SetAddr(hop, g_probeTable[hop].gateway);
+				if(g_probeTable[hop].icmpType == 3) {
+					wmtrnet->SetErrorName(hop, UnreachableCodeToIpStatus(g_probeTable[hop].icmpCode));
+				}
+				resolved = true;
+				break;
+			}
+			// Destination answered the SYN itself? (SYN-ACK = connect
+			// completes; RST = WSAECONNREFUSED). Either way: target reached.
+			fd_set writefds, exceptfds;
+			FD_ZERO(&writefds);
+			FD_ZERO(&exceptfds);
+			FD_SET(s, &writefds);
+			FD_SET(s, &exceptfds);
+			timeval tv = {0, 0};
+			if(select(0, NULL, &writefds, &exceptfds, &tv) > 0) {
+				int rtt = ElapsedMs(g_probeTable[hop].sendTime);
+				if(FD_ISSET(s, &writefds)) {
+					wmtrnet->UpdateRTT(hop, rtt);
+					wmtrnet->AddReturned(hop);
+					wmtrnet->SetAddr(hop, current->address.s_addr);
+				} else {
+					int soErr = 0;
+					int soLen = sizeof(soErr);
+					getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&soErr, &soLen);
+					if(soErr == WSAECONNREFUSED) {
+						wmtrnet->UpdateRTT(hop, rtt);
+						wmtrnet->AddReturned(hop);
+						wmtrnet->SetAddr(hop, current->address.s_addr);
+					} else {
+						wmtrnet->SetErrorName(hop, IP_DEST_HOST_UNREACHABLE);
+					}
+				}
+				resolved = true;
+				break;
+			}
+			Sleep(sliceMs);
+			waited += sliceMs;
+		}
+
+		UnregisterProbe(hop);
+		closesocket(s);	// aborts the half-open connect
+		if(!resolved && wmtrnet->tracing) {
+			wmtrnet->SetErrorName(hop, IP_REQ_TIMED_OUT);
+		}
+		PaceProbe(wmtrnet, probeStartTick);
+	}
+	delete current;
+	return 0;
+}
+
+static unsigned WINAPI UdpProbeThread(void* p)
+{
+	trace_thread* current = (trace_thread*)p;
+	WinMTRNet* wmtrnet = current->winmtr;
+	const int hop = current->ttl - 1;
+	// Classic traceroute port unless -P was given: high and almost certainly
+	// closed on the target, so the final hop answers port-unreachable.
+	const USHORT port = (USHORT)(wmtrnet->wmtrdlg->targetPort > 0 ? wmtrnet->wmtrdlg->targetPort : 33434);
+
+	char payload[8192];
+	WORD payloadLen = wmtrnet->wmtrdlg->pingsize;
+	if(payloadLen > sizeof(payload)) payloadLen = sizeof(payload);
+	memset(payload, 32, payloadLen);
+
+	while(wmtrnet->tracing) {
+		if(current->ttl > wmtrnet->GetMax()) break;
+		DWORD probeStartTick = GetTickCount();
+
+		SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		if(s == INVALID_SOCKET) break;
+		int ttl = current->ttl;
+		setsockopt(s, IPPROTO_IP, IP_TTL, (char*)&ttl, sizeof(ttl));
+
+		sockaddr_in local;
+		memset(&local, 0, sizeof(local));
+		local.sin_family = AF_INET;
+		local.sin_addr = g_probeSrcAddr;
+		bind(s, (sockaddr*)&local, sizeof(local));
+		sockaddr_in bound;
+		int boundLen = sizeof(bound);
+		getsockname(s, (sockaddr*)&bound, &boundLen);
+
+		RegisterProbe(hop, ntohs(bound.sin_port));
+
+		sockaddr_in dst;
+		memset(&dst, 0, sizeof(dst));
+		dst.sin_family = AF_INET;
+		dst.sin_addr = current->address;
+		dst.sin_port = htons(port);
+		sendto(s, payload, payloadLen, 0, (sockaddr*)&dst, sizeof(dst));
+		wmtrnet->AddXmit(hop);
+
+		bool resolved = false;
+		DWORD waited = 0;
+		const DWORD sliceMs = 25;
+		while(waited < ECHO_REPLY_TIMEOUT && wmtrnet->tracing && !resolved) {
+			if(WaitForSingleObject(g_probeTable[hop].event, sliceMs) == WAIT_OBJECT_0) {
+				wmtrnet->UpdateRTT(hop, g_probeTable[hop].rttMs);
+				wmtrnet->AddReturned(hop);
+				wmtrnet->SetAddr(hop, g_probeTable[hop].gateway);
+				if(g_probeTable[hop].icmpType == 3 && g_probeTable[hop].icmpCode != 3) {
+					// Port-unreachable from the target is the expected
+					// "destination reached" signal; other codes are errors.
+					wmtrnet->SetErrorName(hop, UnreachableCodeToIpStatus(g_probeTable[hop].icmpCode));
+				}
+				resolved = true;
+				break;
+			}
+			waited += sliceMs;
+		}
+
+		UnregisterProbe(hop);
+		closesocket(s);
+		if(!resolved && wmtrnet->tracing) {
+			wmtrnet->SetErrorName(hop, IP_REQ_TIMED_OUT);
+		}
+		PaceProbe(wmtrnet, probeStartTick);
+	}
+	delete current;
+	return 0;
+}
+
+void WinMTRNet::DoTraceSocket(sockaddr* sockaddrTarget)
+{
+	// IPv4 TCP/UDP trace. Caller (RunCliMode) guarantees elevation and IPv4.
+	tracing = true;
+	ResetHops();
+	host[0].addr.sin_family = AF_INET;
+	last_remote_addr = ((sockaddr_in*)sockaddrTarget)->sin_addr;
+	g_probeDstAddr = last_remote_addr;
+
+	// Find the outbound interface address so the raw listener and every
+	// probe socket bind to the same source.
+	g_probeSrcAddr.s_addr = INADDR_ANY;
+	SOCKET probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if(probe != INVALID_SOCKET) {
+		sockaddr_in dst = *(sockaddr_in*)sockaddrTarget;
+		dst.sin_port = htons(53);
+		if(connect(probe, (sockaddr*)&dst, sizeof(dst)) == 0) {
+			sockaddr_in bound;
+			int boundLen = sizeof(bound);
+			if(getsockname(probe, (sockaddr*)&bound, &boundLen) == 0) {
+				g_probeSrcAddr = bound.sin_addr;
+			}
+		}
+		closesocket(probe);
+	}
+
+	g_rawIcmpSocket = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if(g_rawIcmpSocket == INVALID_SOCKET) {
+		SetName(0, (char*)"Raw ICMP socket failed - run as Administrator");
+		tracing = false;
+		return;
+	}
+	sockaddr_in bindAddr;
+	memset(&bindAddr, 0, sizeof(bindAddr));
+	bindAddr.sin_family = AF_INET;
+	bindAddr.sin_addr = g_probeSrcAddr;
+	if(bind(g_rawIcmpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
+		closesocket(g_rawIcmpSocket);
+		g_rawIcmpSocket = INVALID_SOCKET;
+		SetName(0, (char*)"Raw ICMP bind failed - run as Administrator");
+		tracing = false;
+		return;
+	}
+
+	if(!g_probeLockInit) {
+		InitializeCriticalSection(&g_probeLock);
+		g_probeLockInit = true;
+	}
+	for(int i = 0; i < MAX_HOPS; ++i) {
+		g_probeTable[i].srcPort = 0;
+		if(!g_probeTable[i].event) {
+			g_probeTable[i].event = CreateEvent(NULL, TRUE, FALSE, NULL);
+		}
+	}
+
+	HANDLE listener = (HANDLE)_beginthreadex(NULL, 0, IcmpListenerThread, this, 0, NULL);
+
+	HANDLE hThreads[MAX_HOPS];
+	unsigned char hops = 0;
+	unsigned (WINAPI* proberFunc)(void*) = wmtrdlg->probeMode == PROBE_TCP ? TcpProbeThread : UdpProbeThread;
+	for(; hops < MAX_HOPS;) {
+		trace_thread* current = new trace_thread;
+		current->address = ((sockaddr_in*)sockaddrTarget)->sin_addr;
+		current->winmtr = this;
+		current->ttl = hops + 1;
+		hThreads[hops] = (HANDLE)_beginthreadex(NULL, 0, proberFunc, current, 0, NULL);
+		InterruptibleTraceSleep(this, 30);
+		if(++hops > this->GetMax()) break;
+	}
+	WaitForMultipleObjects(hops, hThreads, TRUE, INFINITE);
+	for(; hops;) CloseHandle(hThreads[--hops]);
+
+	closesocket(g_rawIcmpSocket);	// unblocks the listener's select/recv
+	g_rawIcmpSocket = INVALID_SOCKET;
+	if(listener) {
+		WaitForSingleObject(listener, 2000);
+		CloseHandle(listener);
+	}
+}
 
 WinMTRNet::WinMTRNet(WinMTRDialog* wp)
 {
@@ -220,8 +615,35 @@ void WinMTRNet::ResetHops()
 	memset(host,0,sizeof(host));
 }
 
+void WinMTRNet::ResetStatistics()
+{
+	// Interactive 'r' (restart statistics): zero the counters but keep the
+	// resolved addresses/names/ASNs so the display does not blank out while
+	// the trace threads keep running.
+	WaitForSingleObject(ghMutex, INFINITE);
+	for(int i = 0; i < MaxHost; ++i) {
+		host[i].xmit = 0;
+		host[i].returned = 0;
+		host[i].total = 0;
+		host[i].m2 = 0;
+		host[i].last = 0;
+		host[i].best = 0;
+		host[i].worst = 0;
+		memset(host[i].hist, 0, sizeof(host[i].hist));
+		host[i].histCount = 0;
+	}
+	ReleaseMutex(ghMutex);
+}
+
 void WinMTRNet::DoTrace(sockaddr* sockaddr)
 {
+	// TCP/UDP probe modes use the socket engine (IPv4 only; the CLI blocks
+	// -T/-u with IPv6 before we get here, and falls back to ICMP otherwise).
+	if(wmtrdlg->probeMode != PROBE_ICMP && sockaddr->sa_family == AF_INET) {
+		DoTraceSocket(sockaddr);
+		return;
+	}
+
 	HANDLE hThreads[MAX_HOPS];
 	unsigned char hops=0;
 	tracing = true;
@@ -585,15 +1007,40 @@ void WinMTRNet::SetErrorName(int at, DWORD errnum)
 void WinMTRNet::UpdateRTT(int at, int rtt)
 {
 	WaitForSingleObject(ghMutex, INFINITE);
-	host[at].last=rtt;
-	host[at].total+=rtt;
-	if(host[at].best>rtt || host[at].xmit==1)
-		host[at].best=rtt;
-	if(host[at].worst<rtt)
-		host[at].worst=rtt;
+	// Welford's online algorithm for running variance.
+	// UpdateRTT is called BEFORE AddReturned, so host[at].returned is the
+	// count of *previous* replies. total has already been incremented below.
+	int prevCount = host[at].returned;
+	host[at].total += rtt;
+	host[at].last = rtt;
+	if(host[at].best > rtt || prevCount == 0)
+		host[at].best = rtt;
+	if(host[at].worst < rtt)
+		host[at].worst = rtt;
+	if(prevCount > 0) {
+		double oldMean = (double)(host[at].total - rtt) / prevCount;
+		double newMean = (double)host[at].total / (prevCount + 1);
+		double delta = rtt - oldMean;
+		host[at].m2 += delta * (rtt - newMean);
+	}
+	// Fill the in-flight history slot AddXmit appended for this probe.
+	if(host[at].histCount > 0) {
+		host[at].hist[(host[at].histCount - 1) % HIST_SLOTS] = rtt;
+	}
 	ReleaseMutex(ghMutex);
 }
 
+int WinMTRNet::GetStDev(int at)
+{
+	WaitForSingleObject(ghMutex, INFINITE);
+	int n = host[at].returned;
+	int ret = 0;
+	if(n > 1) {
+		ret = (int)(sqrt(host[at].m2 / (n - 1)) + 0.5);
+	}
+	ReleaseMutex(ghMutex);
+	return ret;
+}
 void WinMTRNet::AddReturned(int at)
 {
 	WaitForSingleObject(ghMutex, INFINITE);
@@ -605,7 +1052,25 @@ void WinMTRNet::AddXmit(int at)
 {
 	WaitForSingleObject(ghMutex, INFINITE);
 	++host[at].xmit;
+	// Append an in-flight history slot; UpdateRTT overwrites it with the RTT
+	// when a reply arrives, otherwise it stays HIST_LOST.
+	host[at].hist[host[at].histCount % HIST_SLOTS] = HIST_LOST;
+	++host[at].histCount;
 	ReleaseMutex(ghMutex);
+}
+
+int WinMTRNet::GetHistory(int at, int* buffer, int slots)
+{
+	WaitForSingleObject(ghMutex, INFINITE);
+	int available = host[at].histCount < HIST_SLOTS ? host[at].histCount : HIST_SLOTS;
+	int count = available < slots ? available : slots;
+	// oldest-first into buffer, newest last
+	for(int i = 0; i < count; ++i) {
+		int idx = (host[at].histCount - count + i) % HIST_SLOTS;
+		buffer[i] = host[at].hist[idx];
+	}
+	ReleaseMutex(ghMutex);
+	return count;
 }
 
 void DnsResolverThread(void* p)

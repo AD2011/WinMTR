@@ -25,6 +25,21 @@ typedef ICMP_ECHO_REPLY ICMPECHO, *PICMPECHO, FAR* LPICMPECHO;
 
 #define ECHO_REPLY_TIMEOUT 1000
 
+// Probe transport. TCP/UDP use TTL-limited OS sockets plus a raw ICMP
+// listener for TTL-exceeded/unreachable replies (Administrator required,
+// IPv4 only for now) - see PARITY_PLAN.md. SCTP is a documented non-goal:
+// Windows has no SCTP stack.
+enum ProbeMode {
+	PROBE_ICMP = 0,
+	PROBE_TCP  = 1,
+	PROBE_UDP  = 2
+};
+
+// Per-hop history of recent probe outcomes for the CLI strip-chart display
+// mode: >=0 RTT in ms, HIST_LOST for lost/in-flight, ring of HIST_SLOTS.
+#define HIST_SLOTS 72
+#define HIST_LOST  -1
+
 struct s_nethost {
 	union {
 		sockaddr_in addr;
@@ -33,9 +48,12 @@ struct s_nethost {
 	int xmit;			// number of PING packets sent
 	int returned;		// number of ICMP echo replies received
 	unsigned long total;	// total time
+	double m2;			// Welford's M2 for running variance (StDev)
 	int last;				// last time
 	int best;				// best time
 	int worst;			// worst time
+	int hist[HIST_SLOTS];	// recent probe RTTs (ring; HIST_LOST = no reply)
+	int histCount;		// total probes appended to hist (ring position = histCount % HIST_SLOTS)
 	char name[255];
 	char asn[64];
 };
@@ -63,7 +81,9 @@ public:
 	WinMTRNet(WinMTRDialog* wp);
 	~WinMTRNet();
 	void	DoTrace(sockaddr* sockaddr);
+	void	DoTraceSocket(sockaddr* sockaddrTarget);	// TCP/UDP engine (IPv4)
 	void	ResetHops();
+	void	ResetStatistics();	// zero counters but keep addr/name/asn (interactive 'r')
 	void	StopTrace();
 	
 	sockaddr* GetAddr(int at);
@@ -73,10 +93,12 @@ public:
 	int		GetWorst(int at);
 	int		GetAvg(int at);
 	int		GetPercent(int at);
+	int		GetStDev(int at);
 	int		GetLast(int at);
 	int		GetReturned(int at);
 	int		GetXmit(int at);
 	int		GetMax();
+	int		GetHistory(int at, int* buffer, int slots);	// newest-last; returns count copied
 	
 	void	SetAddr(int at, u_long addr);
 	void	SetAddr6(int at, IPV6_ADDRESS_EX addrex);

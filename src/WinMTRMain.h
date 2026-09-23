@@ -21,6 +21,7 @@ struct WinMTRCommandLineOptions {
 		: showHelp(false),
 		  cliMode(false),
 		  forceGui(false),
+		  wantsSctp(false),
 		  reportCycles(0),
 		  reportDurationSeconds(0)
 	{
@@ -29,6 +30,7 @@ struct WinMTRCommandLineOptions {
 	bool showHelp;
 	bool cliMode;
 	bool forceGui;
+	bool wantsSctp;
 	int reportCycles;
 	int reportDurationSeconds;
 	std::string hostName;
@@ -55,6 +57,7 @@ private:
 	bool	RunCliMode(const WinMTRCommandLineOptions& options, WinMTRDialog* wmtrdlg);
 	void	HideOwnedConsoleWindow() const;
 	bool	SetupConsole() const;
+	bool	IsProcessElevated() const;
 	void	WriteConsoleText(const char* text) const;
 	void	PrintHelp() const;
 	int		GetParamValue(LPTSTR cmd, char* param, char sparam, char* value);

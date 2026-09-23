@@ -85,41 +85,190 @@ static std::string CenterCell(const std::string& value, size_t width)
 	return text;
 }
 
-static std::string BuildCliSeparator(char fill)
+// --- mtr-style CLI formatting helpers ---
+
+static const int MTR_HOST_WIDTH = 72;
+static const int MTR_W_LOSS = 6;
+static const int MTR_W_SNT = 4;
+static const int MTR_W_LAST = 6;
+static const int MTR_W_AVG = 6;
+static const int MTR_W_BEST = 5;
+static const int MTR_W_WRST = 6;
+static const int MTR_W_STDEV = 5;
+
+static std::string FormatTimestamp()
 {
-	static const size_t widths[] = {57, 10, 4, 4, 4, 4, 4, 4, 4};
-	std::ostringstream row;
-	row << '|';
-	for(size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
-		row << std::string(widths[i] + 2, fill) << '|';
-	}
-	row << "\r\n";
-	return row.str();
+	time_t now = time(NULL);
+	struct tm tmv;
+	localtime_s(&tmv, &now);
+	char buf[32];
+	strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &tmv);
+	return std::string(buf);
 }
 
-static std::string BuildCliRow(
-	const std::string& host,
-	const std::string& asn,
-	int loss,
-	int sent,
-	int recv,
-	int best,
-	int avrg,
-	int wrst,
-	int last)
+static std::string FormatSockaddr(const sockaddr* addr)
 {
-	std::ostringstream row;
-	row << "| " << PadCell(host, 57, false)
-		<< " | " << PadCell(asn, 10, false)
-		<< " | " << PadCell(std::to_string(loss), 4, true)
-		<< " | " << PadCell(std::to_string(sent), 4, true)
-		<< " | " << PadCell(std::to_string(recv), 4, true)
-		<< " | " << PadCell(std::to_string(best), 4, true)
-		<< " | " << PadCell(std::to_string(avrg), 4, true)
-		<< " | " << PadCell(std::to_string(wrst), 4, true)
-		<< " | " << PadCell(std::to_string(last), 4, true)
-		<< " |\r\n";
-	return row.str();
+	char buf[NI_MAXHOST];
+	if(!getnameinfo(addr, GetSockaddrLength(addr), buf, NI_MAXHOST, NULL, 0, NI_NUMERICHOST)) {
+		return std::string(buf);
+	}
+	return "";
+}
+
+static std::string GetSourceIP(const sockaddr* destAddr)
+{
+	SOCKET s = socket(destAddr->sa_family, SOCK_DGRAM, 0);
+	if(s == INVALID_SOCKET) return "";
+	if(connect(s, destAddr, GetSockaddrLength(destAddr)) == SOCKET_ERROR) {
+		closesocket(s);
+		return "";
+	}
+	sockaddr_storage src;
+	int srcLen = sizeof(src);
+	std::string result;
+	if(getsockname(s, (sockaddr*)&src, &srcLen) == 0) {
+		result = FormatSockaddr((sockaddr*)&src);
+	}
+	closesocket(s);
+	return result;
+}
+
+static std::string GetSourceHostname()
+{
+	char buf[NI_MAXHOST];
+	if(gethostname(buf, NI_MAXHOST) == 0) return std::string(buf);
+	return "";
+}
+
+static std::string FormatLoss(int xmit, int returned)
+{
+	if(xmit == 0) return " 0.0%";
+	char buf[16];
+	sprintf(buf, "%4.1f%%", 100.0 * (xmit - returned) / xmit);
+	return std::string(buf);
+}
+
+static std::string FormatRtt(int ms)
+{
+	char buf[16];
+	sprintf(buf, "%.1f", (double)ms);
+	return std::string(buf);
+}
+
+// --- interactive display state (mtr key bindings) ---
+
+// Field letters follow mtr's -o convention: L=Loss% S=Snt R=Recv N=Last
+// A=Avg B=Best W=Wrst V=StDev. 'o' cycles the presets; a custom -o flag is
+// planned (PARITY_PLAN.md P2).
+static const char* CLI_FIELD_PRESETS[] = { "LSNABWV", "LSRNABWV", "NABWV" };
+static const int CLI_FIELD_PRESET_COUNT = (int)(sizeof(CLI_FIELD_PRESETS) / sizeof(CLI_FIELD_PRESETS[0]));
+static int g_cliFieldPreset = 0;
+static int g_cliDisplayMode = 0;	// 0 = statistics, 1 = packet history strip-chart
+
+struct CliFieldDef {
+	char key;
+	const char* header;
+	int width;
+};
+
+static const CliFieldDef* LookupCliField(char key)
+{
+	static const CliFieldDef defs[] = {
+		{'L', "Loss%", MTR_W_LOSS},
+		{'S', "Snt",   MTR_W_SNT},
+		{'R', "Recv",  5},
+		{'N', "Last",  MTR_W_LAST},
+		{'A', "Avg",   MTR_W_AVG},
+		{'B', "Best",  MTR_W_BEST},
+		{'W', "Wrst",  MTR_W_WRST},
+		{'V', "StDev", MTR_W_STDEV},
+	};
+	for(size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); ++i) {
+		if(defs[i].key == key) return &defs[i];
+	}
+	return NULL;
+}
+
+static std::string FormatStatsHeader()
+{
+	const char* order = CLI_FIELD_PRESETS[g_cliFieldPreset];
+	std::ostringstream header;
+	for(const char* f = order; *f; ++f) {
+		const CliFieldDef* def = LookupCliField(*f);
+		if(!def) continue;
+		if(f != order) header << "  ";
+		header << PadCell(def->header, def->width, true);
+	}
+	return header.str();
+}
+
+static std::string FormatStats(WinMTRDialog* dialog, int at)
+{
+	const char* order = CLI_FIELD_PRESETS[g_cliFieldPreset];
+	std::ostringstream stats;
+	for(const char* f = order; *f; ++f) {
+		const CliFieldDef* def = LookupCliField(*f);
+		if(!def) continue;
+		if(f != order) stats << "  ";
+		std::string value;
+		switch(*f) {
+		case 'L': value = FormatLoss(dialog->wmtrnet->GetXmit(at), dialog->wmtrnet->GetReturned(at)); break;
+		case 'S': value = std::to_string(dialog->wmtrnet->GetXmit(at)); break;
+		case 'R': value = std::to_string(dialog->wmtrnet->GetReturned(at)); break;
+		case 'N': value = FormatRtt(dialog->wmtrnet->GetLast(at)); break;
+		case 'A': value = FormatRtt(dialog->wmtrnet->GetAvg(at)); break;
+		case 'B': value = FormatRtt(dialog->wmtrnet->GetBest(at)); break;
+		case 'W': value = FormatRtt(dialog->wmtrnet->GetWorst(at)); break;
+		case 'V': value = FormatRtt(dialog->wmtrnet->GetStDev(at)); break;
+		}
+		stats << PadCell(value, def->width, true);
+	}
+	return stats.str();
+}
+
+// Packet-history strip chart (display mode 1), like mtr's alternate display:
+// one char per recent probe, '?' = lost, '.'->'>' = latency buckets scaled to
+// the worst RTT currently on screen.
+static const int CLI_HIST_DISPLAY = 48;
+static const char CLI_HIST_CHARS[] = ".123abc>";
+
+static int CliHistoryScaleMax(WinMTRDialog* dialog, int hops)
+{
+	int maxRtt = 0;
+	for(int i = 0; i < hops; ++i) {
+		int worst = dialog->wmtrnet->GetWorst(i);
+		if(worst > maxRtt) maxRtt = worst;
+	}
+	return maxRtt < 8 ? 8 : maxRtt;
+}
+
+static std::string FormatHistory(WinMTRDialog* dialog, int at, int scaleMax)
+{
+	int hist[CLI_HIST_DISPLAY];
+	int count = dialog->wmtrnet->GetHistory(at, hist, CLI_HIST_DISPLAY);
+	std::string out;
+	out.reserve(count);
+	for(int i = 0; i < count; ++i) {
+		if(hist[i] == HIST_LOST) {
+			out.push_back('?');
+		} else {
+			int bucket = hist[i] * 8 / scaleMax;
+			if(bucket > 7) bucket = 7;
+			out.push_back(CLI_HIST_CHARS[bucket]);
+		}
+	}
+	return out;
+}
+
+static std::string FormatHistoryScaleLegend(int scaleMax)
+{
+	std::ostringstream legend;
+	legend << "Scale:";
+	for(int b = 0; b < 8; ++b) {
+		legend << "  " << CLI_HIST_CHARS[b] << ":" << (scaleMax * (b + 1) / 8) << "ms";
+	}
+	legend << "   ?:lost";
+	return legend.str();
 }
 
 struct cli_trace_thread {
@@ -263,7 +412,7 @@ static void EndCliScreenSession()
 static bool ClearCliScreen()
 {
 	if(g_cliUsingVirtualTerminal) {
-		WriteCliOutput("\x1b[H\x1b[2J");
+		WriteCliOutput("\x1b[H\x1b[0J");
 		return true;
 	}
 
@@ -282,10 +431,21 @@ static bool ClearCliScreen()
 	return true;
 }
 
-static bool PollCliStopRequest()
+// Polls console input. Returns true when a stop was requested (Ctrl+C /
+// Ctrl+Break, via the control handler or the input buffer). Any other
+// printable key pressed since the last poll is returned through keyOut
+// (0 = none) for the interactive key bindings.
+//
+// This is now a console-subsystem binary, so the shell WAITS for the CLI run
+// and does not compete for console input - plain keys reach us reliably. The
+// Ctrl+C path is kept redundant (handler + 0x03 drain) because it also covers
+// legacy/edge launches; see PARITY_PLAN.md and tests/ctrlc.
+static bool PollCliInput(int* keyOut)
 {
-	// The console control handler (Ctrl+Break / session-close) sets the
-	// counter; check it first.
+	if(keyOut) *keyOut = 0;
+
+	// The console control handler (Ctrl+C / Ctrl+Break / session-close) sets
+	// the counter; check it first.
 	if(InterlockedCompareExchange(&g_cliStopCount, 0, 0) != 0) {
 		return true;
 	}
@@ -295,22 +455,13 @@ static bool PollCliStopRequest()
 		return false;
 	}
 
-	// Re-assert the CLI input mode (ENABLE_PROCESSED_INPUT on). The shell
-	// that launched us is still reading this console concurrently - it does
-	// not wait for a Windows-subsystem process - and it rewrites the input
-	// mode whenever it handles a keystroke. Processed input ON is what makes
-	// conhost turn Ctrl+C into a CTRL_C_EVENT broadcast (which reaches
-	// CliConsoleHandler no matter who is reading the input buffer) instead
-	// of a queued key event the shell can steal.
+	// Re-assert the CLI input mode: ENABLE_PROCESSED_INPUT on (so conhost
+	// turns Ctrl+C into a CTRL_C_EVENT broadcast for the handler), echo and
+	// line input off (so single keypresses arrive without Enter and typed
+	// keys do not smear the live display).
 	if(g_cliHaveDesiredInputMode) {
 		SetConsoleMode(input, g_cliDesiredInputMode);
 	}
-
-	// Secondary detector: drain any key events that did land in the input
-	// buffer (e.g. a Ctrl+C pressed in the brief window after the shell
-	// reset the mode and before the re-assert above) and look for 0x03 /
-	// Ctrl+C / Ctrl+Break. Also keeps typed keys from smearing the shell's
-	// hidden prompt underneath the live screen.
 
 	DWORD eventCount = 0;
 	if(!GetNumberOfConsoleInputEvents(input, &eventCount) || eventCount == 0) {
@@ -341,6 +492,9 @@ static bool PollCliStopRequest()
 				InterlockedIncrement(&g_cliStopCount);
 				return true;
 			}
+			if(keyOut && !ctrlPressed && (unsigned char)ascii >= 0x20) {
+				*keyOut = (unsigned char)ascii;
+			}
 		}
 		if(!GetNumberOfConsoleInputEvents(input, &eventCount)) {
 			break;
@@ -350,65 +504,137 @@ static bool PollCliStopRequest()
 	return InterlockedCompareExchange(&g_cliStopCount, 0, 0) != 0;
 }
 
-static std::string BuildCliScreen(WinMTRDialog* dialog, const char* hostname, int cycles, int durationSeconds, DWORD elapsedMs, bool finalReport = false)
+static bool PollCliStopRequest()
+{
+	return PollCliInput(NULL);
+}
+
+static std::string BuildCliScreen(WinMTRDialog* dialog, const char* hostname,
+	const std::string& sourceHost, const std::string& sourceIP, const std::string& destIP,
+	int /*cycles*/, int /*durationSeconds*/, DWORD /*elapsedMs*/, bool finalReport)
 {
 	char host[255];
 	char asn[64];
 	std::ostringstream screen;
 	int nh = dialog->wmtrnet->GetMax();
-	int currentCycle = dialog->wmtrnet->GetXmit(0);
+	// The final scrollback report is always the statistics table, whatever
+	// display mode the live view was in.
+	int displayMode = finalReport ? 0 : g_cliDisplayMode;
 
-	if(finalReport) {
-		screen << "WinMTR report for " << hostname << "\r\n\r\n";
+	// Header — matches `mtr` default display
+	screen << "My traceroute  [WinMTR 2.0]\r\n";
+
+	// Source -> Dest line with right-aligned timestamp
+	std::string srcDst = sourceHost + " (" + sourceIP + ") -> " + hostname + " (" + destIP + ")";
+	std::string ts = FormatTimestamp();
+	int padWidth = 80 - (int)srcDst.length() - (int)ts.length();
+	if(padWidth < 2) padWidth = 2;
+	screen << srcDst << std::string(padWidth, ' ') << ts << "\r\n";
+
+	if(!finalReport) {
+		screen << "Keys:  Help   Display mode   Restart statistics   Order of fields   quit\r\n";
 	} else {
-		screen << "WinMTR live report for " << hostname << "\r\n";
-		screen << "Press Ctrl+C to stop.\r\n\r\n";
+		screen << "\r\n";
 	}
-	screen << BuildCliSeparator('-');
-	screen << "| " << CenterCell("WinMTR statistics", 105) << " |\r\n";
-	screen << BuildCliSeparator('-');
-	screen << "| " << CenterCell("Host", 57)
-		   << " | " << CenterCell("ASN", 10)
-		   << " | " << CenterCell("%", 4)
-		   << " | " << CenterCell("Sent", 4)
-		   << " | " << CenterCell("Recv", 4)
-		   << " | " << CenterCell("Best", 4)
-		   << " | " << CenterCell("Avrg", 4)
-		   << " | " << CenterCell("Wrst", 4)
-		   << " | " << CenterCell("Last", 4)
-		   << " |\r\n";
-	screen << BuildCliSeparator('-');
 
+	int scaleMax = 0;
+	if(displayMode == 1) {
+		scaleMax = CliHistoryScaleMax(dialog, nh);
+		screen << PadCell("", MTR_HOST_WIDTH) << "Recent probes (newest right)\r\n";
+		screen << PadCell(" Host", MTR_HOST_WIDTH) << "\r\n";
+	} else {
+		// Column group labels (Packets / Pings) — only meaningful for the
+		// default field order.
+		if(g_cliFieldPreset == 0 || finalReport) {
+			int packetsWidth = MTR_W_LOSS + 2 + MTR_W_SNT;
+			int pingsWidth = MTR_W_LAST + 2 + MTR_W_AVG + 2 + MTR_W_BEST + 2 + MTR_W_WRST + 2 + MTR_W_STDEV;
+			screen << PadCell("", MTR_HOST_WIDTH) << CenterCell("Packets", packetsWidth) << CenterCell("Pings", pingsWidth) << "\r\n";
+		} else {
+			screen << "\r\n";
+		}
+		screen << PadCell(" Host", MTR_HOST_WIDTH) << FormatStatsHeader() << "\r\n";
+	}
+
+	// Hop rows
 	for(int i = 0; i < nh; ++i) {
 		dialog->wmtrnet->GetName(i, host);
-		if(strcmp(host, "") == 0) strcpy(host, "No response from host");
 		dialog->wmtrnet->GetASN(i, asn);
-		if(strcmp(asn, "") == 0) strcpy(asn, "-");
 
-		screen << BuildCliRow(
-			host,
-			asn,
-			dialog->wmtrnet->GetPercent(i),
-			dialog->wmtrnet->GetXmit(i),
-			dialog->wmtrnet->GetReturned(i),
-			dialog->wmtrnet->GetBest(i),
-			dialog->wmtrnet->GetAvg(i),
-			dialog->wmtrnet->GetWorst(i),
-			dialog->wmtrnet->GetLast(i));
+		int returned = dialog->wmtrnet->GetReturned(i);
+		if(returned == 0) {
+			// No replies yet — mtr shows "(waiting for reply)" with no stats
+			char num[8];
+			sprintf(num, "%2d.", i + 1);
+			screen << num << " (waiting for reply)\r\n";
+		} else {
+			std::string asnStr = (asn[0] != '\0') ? asn : "AS???";
+			char hopAsn[32];
+			sprintf(hopAsn, "%2d. %-7s  ", i + 1, asnStr.c_str());
+			std::string hostEntry = std::string(hopAsn) + host;
+			screen << PadCell(hostEntry, MTR_HOST_WIDTH, false);
+			if(displayMode == 1) {
+				screen << FormatHistory(dialog, i, scaleMax);
+			} else {
+				screen << FormatStats(dialog, i);
+			}
+			screen << "\r\n";
+		}
 	}
 
-	screen << BuildCliSeparator('-');
-	screen << "   WinMTR 2.0 GPLv2\r\n\r\n";
-
-	if(durationSeconds > 0) {
-		screen << "Elapsed: " << (elapsedMs / 1000) << "s / " << durationSeconds << "s";
-	} else if(cycles > 0) {
-		screen << "Cycles: " << currentCycle << " / " << cycles;
-	} else {
-		screen << "Cycles: " << currentCycle;
+	if(displayMode == 1) {
+		screen << "\r\n" << FormatHistoryScaleLegend(scaleMax) << "\r\n";
 	}
-	screen << "\r\n";
+
 	return screen.str();
+}
+
+// Help screen for the interactive keys ('h' / '?'). Returns true if a stop
+// was requested while it was up.
+static bool RunCliHelpScreen(WinMTRDialog* dialog)
+{
+	std::ostringstream help;
+	help << "My traceroute  [WinMTR 2.0] - interactive commands\r\n\r\n";
+	help << "  h ?     this help screen\r\n";
+	help << "  d       switch display mode (statistics / packet history)\r\n";
+	help << "  r       restart statistics\r\n";
+	help << "  o       cycle field order (";
+	for(int i = 0; i < CLI_FIELD_PRESET_COUNT; ++i) {
+		if(i) help << ", ";
+		help << CLI_FIELD_PRESETS[i];
+	}
+	help << ")\r\n";
+	help << "  p       pause display (probing continues); any key resumes\r\n";
+	help << "  q       quit\r\n";
+	help << "  Ctrl+C  quit\r\n\r\n";
+	help << "Field letters: L=Loss% S=Snt R=Recv N=Last A=Avg B=Best W=Wrst V=StDev\r\n\r\n";
+	help << "Press any key to return.\r\n";
+
+	ClearCliScreen();
+	WriteCliOutput(help.str().c_str());
+
+	while(dialog->wmtrnet->tracing) {
+		Sleep(100);
+		int key = 0;
+		if(PollCliInput(&key)) return true;
+		if(key == 'q' || key == 'Q') return true;
+		if(key) return false;
+	}
+	return false;
+}
+
+// Pause ('p'): freeze the display until any key. Probing continues in the
+// worker threads. Returns true if a stop was requested.
+static bool RunCliPause(WinMTRDialog* dialog)
+{
+	WriteCliOutput("\r\n -- display paused, any key resumes --");
+	while(dialog->wmtrnet->tracing) {
+		Sleep(100);
+		int key = 0;
+		if(PollCliInput(&key)) return true;
+		if(key == 'q' || key == 'Q') return true;
+		if(key) return false;
+	}
+	return false;
 }
 
 //*****************************************************************************
@@ -462,6 +688,8 @@ WinMTRDialog::WinMTRDialog(CWnd* pParent)
 	hasMaxLRUFromCmdLine = false;
 	hasUseDNSFromCmdLine = false;
 	hasUseIPv6FromCmdLine = false;
+	probeMode = PROBE_ICMP;
+	targetPort = 0;
 	
 	traceThreadMutex = CreateMutex(NULL, FALSE, NULL);
 	wmtrnet = new WinMTRNet(this);
@@ -1304,8 +1532,13 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 	trace->addressLength = GetSockaddrLength(anfo->ai_addr);
 	memset(&trace->address, 0, sizeof(trace->address));
 	memcpy(&trace->address, anfo->ai_addr, trace->addressLength);
-	freeaddrinfo(anfo);
 
+	// Compute source/dest info for the mtr-style header (once, before the loop)
+	std::string sourceHost = GetSourceHostname();
+	std::string sourceIP = GetSourceIP((sockaddr*)&trace->address);
+	std::string destIP = FormatSockaddr((sockaddr*)&trace->address);
+	if(sourceIP.empty()) sourceIP = "0.0.0.0";
+	if(destIP.empty()) destIP = hostname;
 	DWORD waitTime = 0;
 	if(durationSeconds > 0) {
 		waitTime = durationSeconds * 1000;
@@ -1329,19 +1562,56 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 	BeginCliScreenSession();
 
 	DWORD startTick = GetTickCount();
-	int lastRenderedCycle = -1;
 	bool running = true;
 	while(running) {
 		for(int waited = 0; waited < 10 && running; ++waited) {
 			Sleep(100);
-			if(PollCliStopRequest()) {
+			int key = 0;
+			if(PollCliInput(&key)) {
 				running = false;
+				break;
 			}
+			if(!key) continue;
+			bool redrawNow = false;
+			switch(key) {
+			case 'q': case 'Q':
+				running = false;
+				break;
+			case 'r': case 'R':
+				wmtrnet->ResetStatistics();
+				redrawNow = true;
+				break;
+			case 'd': case 'D':
+				g_cliDisplayMode = (g_cliDisplayMode + 1) % 2;
+				redrawNow = true;
+				break;
+			case 'o': case 'O':
+				g_cliFieldPreset = (g_cliFieldPreset + 1) % CLI_FIELD_PRESET_COUNT;
+				redrawNow = true;
+				break;
+			case 'p': case 'P':
+				if(RunCliPause(this)) running = false;
+				redrawNow = true;
+				break;
+			case 'h': case 'H': case '?':
+				if(RunCliHelpScreen(this)) running = false;
+				redrawNow = true;
+				break;
+			}
+			if(redrawNow) break;	// fall through to an immediate redraw
 		}
-		int currentCycle = wmtrnet->GetXmit(0);
+		// Cycle count = the furthest any hop has probed. Gating on hop 0
+		// alone deadlocks a -c run when that single hop's prober stalls
+		// (seen with a VPN gateway that wedges TTL=1 echoes).
+		int currentCycle = 0;
+		int hopCount = wmtrnet->GetMax();
+		for(int i = 0; i < hopCount; ++i) {
+			int xmit = wmtrnet->GetXmit(i);
+			if(xmit > currentCycle) currentCycle = xmit;
+		}
 		DWORD elapsedMs = GetTickCount() - startTick;
 
-		std::string screen = BuildCliScreen(this, hostname, cycles, durationSeconds, elapsedMs);
+		std::string screen = BuildCliScreen(this, hostname, sourceHost, sourceIP, destIP, cycles, durationSeconds, elapsedMs, false);
 		ClearCliScreen();
 		WriteCliOutput(screen.c_str());
 
@@ -1349,10 +1619,9 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 			running = false;
 		} else if(durationSeconds > 0 && elapsedMs >= (DWORD)(durationSeconds * 1000)) {
 			running = false;
-		} else if(cycles > 0 && currentCycle >= cycles && currentCycle != lastRenderedCycle) {
+		} else if(cycles > 0 && currentCycle >= cycles) {
 			running = false;
 		}
-		lastRenderedCycle = currentCycle;
 	}
 
 	wmtrnet->StopTrace();
@@ -1373,7 +1642,7 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 	while(WaitForSingleObject(worker, sliceMs) == WAIT_TIMEOUT) {
 		waitedMs += sliceMs;
 		if(PollCliStopRequest() || waitedMs >= hardCapMs) {
-			std::string finalReport = BuildCliScreen(this, hostname, cycles, durationSeconds, GetTickCount() - startTick, true);
+		std::string finalReport = BuildCliScreen(this, hostname, sourceHost, sourceIP, destIP, cycles, durationSeconds, GetTickCount() - startTick, true);
 			EndCliScreenSession();
 			WriteCliOutput("\r\n");
 			WriteCliOutput(finalReport.c_str());
@@ -1381,7 +1650,7 @@ int WinMTRDialog::RunCliTrace(const char* hostname, int cycles, int durationSeco
 		}
 	}
 	CloseHandle(worker);
-	std::string finalReport = BuildCliScreen(this, hostname, cycles, durationSeconds, GetTickCount() - startTick, true);
+	std::string finalReport = BuildCliScreen(this, hostname, sourceHost, sourceIP, destIP, cycles, durationSeconds, GetTickCount() - startTick, true);
 	EndCliScreenSession();
 	SetConsoleCtrlHandler(CliConsoleHandler, FALSE);
 	InterlockedExchange(&g_cliStopCount, previousStopCount);

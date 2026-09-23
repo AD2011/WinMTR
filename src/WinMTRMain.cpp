@@ -100,8 +100,10 @@ BOOL WinMTRMain::InitInstance()
 	}
 
 	if(options.cliMode) {
-		RunCliMode(options, &mtrDialog);
-		return FALSE;
+		bool ok = RunCliMode(options, &mtrDialog);
+		// Script-friendly exit code (mtr convention): 0 on success, 1 on
+		// refused/failed runs (bad host, SCTP, missing elevation).
+		ExitProcess(ok ? 0 : 1);
 	}
 
 	HideOwnedConsoleWindow();
@@ -170,6 +172,18 @@ bool WinMTRMain::ParseCommandLineParams(LPTSTR cmd, WinMTRDialog* wmtrdlg, WinMT
 		options.cliMode = true;
 		options.reportDurationSeconds = max(1, atoi(value));
 	}
+	if(GetParamValue(cmd, "tcp", 'T', NULL)) {
+		wmtrdlg->probeMode = PROBE_TCP;
+	}
+	if(GetParamValue(cmd, "udp", 'u', NULL)) {
+		wmtrdlg->probeMode = PROBE_UDP;
+	}
+	if(GetParamValue(cmd, "sctp", 'S', NULL)) {
+		options.wantsSctp = true;
+	}
+	if(GetParamValue(cmd, "port", 'P', value)) {
+		wmtrdlg->targetPort = atoi(value);
+	}
 	if(!options.forceGui && hasAnyCliArguments) {
 		options.cliMode = true;
 	}
@@ -179,6 +193,11 @@ bool WinMTRMain::ParseCommandLineParams(LPTSTR cmd, WinMTRDialog* wmtrdlg, WinMT
 bool WinMTRMain::RunCliMode(const WinMTRCommandLineOptions& options, WinMTRDialog* wmtrdlg)
 {
 	if(!SetupConsole()) return false;
+	if(options.wantsSctp) {
+		WriteConsoleText("SCTP probes are not supported: Windows has no SCTP protocol stack.\n"
+			"Use ICMP (default), --tcp, or --udp instead.\n");
+		return false;
+	}
 	if(options.hostName.empty()) {
 		WriteConsoleText("No host specified.\n\n");
 		PrintHelp();
@@ -188,52 +207,92 @@ bool WinMTRMain::RunCliMode(const WinMTRCommandLineOptions& options, WinMTRDialo
 		WriteConsoleText("WinMTR network initialization failed.\n");
 		return false;
 	}
+	if(wmtrdlg->probeMode != PROBE_ICMP && !IsProcessElevated()) {
+		// TCP/UDP traces read ICMP TTL-exceeded replies from a raw ICMP
+		// socket, which Windows silently starves for non-elevated processes
+		// (verified empirically: the socket binds but never receives).
+		WriteConsoleText("TCP/UDP trace modes require Administrator privileges.\n"
+			"Re-run from an elevated terminal, or use the default ICMP mode.\n");
+		return false;
+	}
+	if(wmtrdlg->probeMode != PROBE_ICMP && wmtrdlg->hasUseIPv6FromCmdLine && wmtrdlg->useIPv6 == 1) {
+		WriteConsoleText("TCP/UDP trace modes are IPv4-only for now (IPv6 support is planned - see PARITY_PLAN.md).\n");
+		return false;
+	}
 	return wmtrdlg->RunCliTrace(options.hostName.c_str(), options.reportCycles, options.reportDurationSeconds) != 0;
 }
 
 void WinMTRMain::HideOwnedConsoleWindow() const
 {
+	// This is now a console-subsystem binary (so the shell waits for CLI runs
+	// and owns no competing console reads - see PARITY_PLAN.md). When the GUI
+	// is launched by double-click, the OS gives us a fresh console window we
+	// are the only user of: release it so it closes instead of lingering
+	// behind the dialog. When launched from a terminal (process list > 1),
+	// keep the attachment - detaching would not stop the shell from waiting.
 	HWND consoleWindow = GetConsoleWindow();
 	if(!consoleWindow) return;
 
 	DWORD processIds[8] = {0};
 	DWORD count = GetConsoleProcessList(processIds, sizeof(processIds) / sizeof(processIds[0]));
 	if(count <= 1) {
-		ShowWindow(consoleWindow, SW_HIDE);
+		FreeConsole();
 	}
 }
 
 bool WinMTRMain::SetupConsole() const
 {
-	// Do NOT short-circuit on a non-NULL GetStdHandle(STD_OUTPUT_HANDLE).
-	// A Windows-subsystem app launched from a terminal inherits pipe handles
-	// (from cmd, PowerShell, ConPTY, SSH) that are non-NULL but are NOT console
-	// handles. GetConsoleMode / SetConsoleMode / ReadConsoleInput all fail on
-	// them, so Ctrl+C detection and VT processing never work. We must always
-	// attach the parent's real console and bind CONIN$/CONOUT$ as the standard
-	// handles.
-	if(!AttachConsole(ATTACH_PARENT_PROCESS) && GetLastError() != ERROR_ACCESS_DENIED) {
-		if(!AllocConsole()) {
-			return false;
+	// Console-subsystem builds normally arrive here already attached to the
+	// parent console with valid std handles. Attach/alloc only covers exotic
+	// launches (DETACHED_PROCESS, or a service-style parent).
+	if(GetConsoleWindow() == NULL) {
+		if(!AttachConsole(ATTACH_PARENT_PROCESS) && GetLastError() != ERROR_ACCESS_DENIED) {
+			if(!AllocConsole()) {
+				return false;
+			}
 		}
 	}
 
-	// CONIN$/CONOUT$ must be opened with FILE_SHARE_READ | FILE_SHARE_WRITE:
-	// the console is shared with the shell that launched us (it keeps its own
-	// read/write handles open), and a narrower share mode can fail the open.
-	HANDLE conOut = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-	if(conOut != INVALID_HANDLE_VALUE) {
-		SetStdHandle(STD_OUTPUT_HANDLE, conOut);
-		SetStdHandle(STD_ERROR_HANDLE, conOut);
+	// Rebind a std handle to the real console ONLY when it is missing.
+	// A valid handle is either already the console or an explicit user
+	// redirection (pipe/file) that must be preserved so
+	// `WinMTR host -r > out.txt` works. CONIN$/CONOUT$ are opened with
+	// FILE_SHARE_READ | FILE_SHARE_WRITE - the console can be shared with
+	// other processes holding their own handles.
+	HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+	if(out == NULL || out == INVALID_HANDLE_VALUE) {
+		HANDLE conOut = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+		if(conOut != INVALID_HANDLE_VALUE) {
+			SetStdHandle(STD_OUTPUT_HANDLE, conOut);
+			SetStdHandle(STD_ERROR_HANDLE, conOut);
+		}
 	}
 
-	HANDLE conIn = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-	if(conIn != INVALID_HANDLE_VALUE) {
-		SetStdHandle(STD_INPUT_HANDLE, conIn);
+	HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+	if(in == NULL || in == INVALID_HANDLE_VALUE) {
+		HANDLE conIn = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+		if(conIn != INVALID_HANDLE_VALUE) {
+			SetStdHandle(STD_INPUT_HANDLE, conIn);
+		}
 	}
 
 	HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
 	return output != NULL && output != INVALID_HANDLE_VALUE;
+}
+
+bool WinMTRMain::IsProcessElevated() const
+{
+	BOOL elevated = FALSE;
+	HANDLE token = NULL;
+	if(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+		TOKEN_ELEVATION elevation;
+		DWORD size = sizeof(elevation);
+		if(GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size)) {
+			elevated = elevation.TokenIsElevated;
+		}
+		CloseHandle(token);
+	}
+	return elevated != FALSE;
 }
 
 void WinMTRMain::WriteConsoleText(const char* text) const
@@ -261,7 +320,13 @@ void WinMTRMain::PrintHelp() const
 	help << "  -s, --size BYTES         ICMP payload size.\n";
 	help << "  -n, --numeric            Do not perform reverse DNS lookups.\n";
 	help << "  -4, --ipv4               Force IPv4.\n";
-	help << "  -6, --ipv6               Force IPv6.\n\n";
+	help << "  -6, --ipv6               Force IPv6.\n";
+	help << "  -T, --tcp                Use TCP SYN probes (requires Administrator, IPv4 only).\n";
+	help << "  -u, --udp                Use UDP probes (requires Administrator, IPv4 only).\n";
+	help << "  -P, --port PORT          Target port for --tcp (default 80) / --udp (default 33434).\n\n";
+	help << "Interactive keys in live mode:\n";
+	help << "  h/?  help    d  display mode    r  restart statistics\n";
+	help << "  o    field order    p  pause    q / Ctrl+C  quit\n\n";
 	help << "CLI mode refreshes continuously until Ctrl+C by default.\n";
 	help << "CLI reports include per-hop ASN lookup when available.\n";
 	WriteConsoleText(help.str().c_str());
@@ -342,7 +407,8 @@ int WinMTRMain::GetHostNameParamValue(LPTSTR cmd, std::string& host_name)
 		"-s", "--size",
 		"-m", "--maxLRU",
 		"-c", "--report-cycles",
-		"-w", "--report-seconds"
+		"-w", "--report-seconds",
+		"-P", "--port"
 	};
 
 	for(size_t i = 0; i < args.size(); ++i) {

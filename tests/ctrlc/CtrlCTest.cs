@@ -78,12 +78,13 @@ static class CtrlCTest
     {
         // usage: CtrlCTest.exe <shell|direct> <targetExe> <targetArgs> [settleSec] [ctrlCPresses]
         logFile = new StreamWriter(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "harness.log"), false);
-        if (args.Length < 3) { Log("usage: CtrlCTest <shell|direct> <targetExe> <targetArgs> [settleSec] [presses]"); return 2; }
+        if (args.Length < 3) { Log("usage: CtrlCTest <shell|cmdshell|direct> <targetExe> <targetArgs> [settleSec] [presses] [keyByte]"); return 2; }
         string mode = args[0];
         string targetExe = args[1];
         string targetArgs = args[2];
         int settleSec = args.Length > 3 ? int.Parse(args[3]) : 5;
         int presses = args.Length > 4 ? int.Parse(args[4]) : 3;
+        byte keyByte = args.Length > 5 ? byte.Parse(args[5]) : (byte)0x03;
         string targetName = Path.GetFileNameWithoutExtension(targetExe);
 
         // 1. pipes + pseudoconsole
@@ -175,12 +176,12 @@ static class CtrlCTest
             Thread.Sleep(settleSec * 1000);
             if (target.HasExited) { Log("FAIL(setup): target exited before Ctrl+C was sent"); DumpTail(); return 2; }
 
-            // 5. hammer Ctrl+C like the user did
+            // 5. hammer the key like the user did (default 0x03 = Ctrl+C)
             bool exited = false;
             for (int i = 0; i < presses && !exited; i++)
             {
-                Log("sending 0x03 (press " + (i + 1) + "/" + presses + ")");
-                ptyIn.WriteByte(0x03);
+                Log("sending 0x" + keyByte.ToString("x2") + " (press " + (i + 1) + "/" + presses + ")");
+                ptyIn.WriteByte(keyByte);
                 ptyIn.Flush();
                 exited = target.WaitForExit(3000);
             }
