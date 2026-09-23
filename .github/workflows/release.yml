@@ -3,19 +3,25 @@ name: Build and Release
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+  pull_request:
+    branches:
+      - main
   release:
     types:
       - published
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     name: Build ${{ matrix.name }}
-    runs-on: windows-latest
+    # Keep v143 paired with the VS 2022 MFC headers and libraries.
+    runs-on: windows-2022
 
     strategy:
       fail-fast: false
@@ -34,6 +40,8 @@ jobs:
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
 
       - name: Build WinMTR
         shell: pwsh
@@ -71,7 +79,12 @@ jobs:
     name: Publish GitHub Release Assets
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
+    if: >-
+      github.event_name == 'release' ||
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: write
 
     steps:
       - name: Download packaged artifacts
@@ -80,8 +93,21 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Publish release assets
+      - name: Publish main build release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: main-build-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: Main build ${{ github.run_number }}
+          files: dist/*.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      - name: Publish versioned release assets
+        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip
+          fail_on_unmatched_files: true
           generate_release_notes: true

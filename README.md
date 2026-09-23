@@ -75,6 +75,15 @@ The release binary is written to:
 src\Release_x64\WinMTR.exe
 ```
 
+## Automated Builds and Releases
+
+- Pull requests targeting `main` build x64 and x86 ZIPs, available as workflow artifacts.
+- Every push to `main`, including a merged pull request, builds both architectures and creates a separate GitHub release tagged `main-build-<run number>` at the exact commit built. Publishing runs only after both builds succeed. Re-running the same workflow run updates that run's release.
+- Pushing a `v*` tag or publishing a release builds and attaches ZIPs to that versioned release.
+- Running the workflow manually on a branch builds artifacts only; running it on a tag also publishes release assets.
+
+CI uses the Windows Server 2022 runner with Visual Studio 2022 and the `v143` toolset so the compiler and installed MFC libraries match.
+
 ## Credits
 
 - [mtr](https://github.com/traviscross/mtr) by Travis Cross and contributors
